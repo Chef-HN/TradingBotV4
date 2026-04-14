@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Verify Email — TradingBotV3{% endblock %}
+{% block content %}
+<h1>Verify Your Email</h1>
+<div class="info">A 6-digit code was sent to <strong>{{ email }}</strong></div>
+<form action="/auth/verify-otp" method="post">
+  <input type="hidden" name="email" value="{{ email }}">
+  <input type="hidden" name="display_name" value="{{ display_name }}">
+  <input type="hidden" name="password" value="{{ password }}">
+  <input type="hidden" name="preferred_locale" value="{{ preferred_locale or 'en' }}">
+  <div class="field">
+    <label>Verification Code</label>
+    <input class="otp-input" type="text" name="code" required maxlength="6" pattern="\d{6}" autofocus>
+  </div>
+  <button class="btn" type="submit">Verify</button>
+</form>
+<div class="links">
+  <form action="/auth/resend-otp" method="post" style="display:inline">
+    <input type="hidden" name="email" value="{{ email }}">
+    <input type="hidden" name="display_name" value="{{ display_name }}">
+    <input type="hidden" name="password" value="{{ password }}">
+    <input type="hidden" name="preferred_locale" value="{{ preferred_locale or 'en' }}">
+    <button type="submit" style="background:none;border:none;color:var(--blue);cursor:pointer;font-family:inherit;font-size:12px;">
+      Resend code
+    </button>
+  </form>
+</div>
+{% endblock %}

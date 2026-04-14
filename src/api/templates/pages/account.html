@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Account — TradingBotV3{% endblock %}
+{% block content %}
+<h1>Account</h1>
+<div class="info" style="margin-bottom:20px;">{{ user.email }}</div>
+
+<div style="border:1px solid var(--red);border-radius:8px;padding:20px;margin-bottom:16px;">
+  <div style="font-size:13px;font-weight:600;color:var(--red);margin-bottom:6px;">Danger Zone</div>
+  <div style="font-size:12px;color:var(--muted);margin-bottom:16px;">
+    Permanently deletes your account and all associated data. This cannot be undone.
+  </div>
+  <button class="btn" id="btn-delete-show"
+    style="background:var(--red);"
+    onclick="document.getElementById('confirm-delete').style.display='block';this.style.display='none';">
+    Delete Account
+  </button>
+  <div id="confirm-delete" style="display:none;">
+    <div style="font-size:12px;color:var(--red);margin-bottom:12px;">
+      Are you sure? This will permanently delete your account.
+    </div>
+    <form action="/auth/account/delete" method="post" style="display:flex;gap:8px;">
+      <button type="button" class="btn"
+        style="background:var(--surface);border:1px solid var(--border);flex:1;"
+        onclick="document.getElementById('confirm-delete').style.display='none';document.getElementById('btn-delete-show').style.display='block';">
+        Cancel
+      </button>
+      <button type="submit" class="btn" style="background:var(--red);flex:1;">Confirm Delete</button>
+    </form>
+  </div>
+</div>
+
+<div class="links">
+  <a href="/">← Back to dashboard</a>
+</div>
+{% endblock %}

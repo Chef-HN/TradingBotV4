@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Register — TradingBotV3{% endblock %}
+{% block content %}
+<h1>Create Account</h1>
+<form action="/auth/register" method="post">
+  <div class="field">
+    <label>Display Name</label>
+    <input type="text" name="display_name" required autofocus>
+  </div>
+  <div class="field">
+    <label>Email</label>
+    <input type="email" name="email" required>
+  </div>
+  <div class="field">
+    <label>Password</label>
+    <input type="password" name="password" required minlength="6">
+  </div>
+  <div class="field">
+    <label>Preferred Language</label>
+    <select name="preferred_locale">
+      <option value="en" {{ 'selected' if locale == 'en' else '' }}>English</option>
+      <option value="es" {{ 'selected' if locale == 'es' else '' }}>Español</option>
+    </select>
+  </div>
+  <button class="btn" type="submit">Create Account</button>
+</form>
+<div class="links">
+  Already have an account? <a href="/auth/login">Sign in</a>
+</div>
+{% endblock %}

@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}TradingBotV3{% endblock %}</title>
+<style>
+  :root {
+    --bg:      #0d1117;
+    --surface: #161b22;
+    --border:  #21262d;
+    --text:    #c9d1d9;
+    --muted:   #8b949e;
+    --green:   #3fb950;
+    --red:     #f85149;
+    --blue:    #58a6ff;
+    --accent:  #1f6feb;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px;
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 36px 40px; width: 100%; max-width: 400px;
+  }
+  .brand {
+    text-align: center; margin-bottom: 28px;
+  }
+  .brand-title { font-size: 18px; font-weight: 700; color: var(--blue); letter-spacing: 0.5px; }
+  .brand-sub { font-size: 11px; color: var(--muted); margin-top: 4px; text-transform: uppercase; letter-spacing: 1px; }
+  h1 { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 20px; text-align: center; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; }
+  .field input, .field select {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 5px;
+    padding: 8px 12px; font-size: 13px; font-family: inherit;
+    outline: none; transition: border-color 0.15s;
+  }
+  .field input:focus, .field select:focus { border-color: var(--accent); }
+  .btn {
+    width: 100%; padding: 9px; border-radius: 5px; border: none;
+    background: var(--accent); color: #fff; font-family: inherit;
+    font-size: 13px; font-weight: 600; cursor: pointer; margin-top: 6px;
+    transition: opacity 0.15s;
+  }
+  .btn:hover { opacity: 0.85; }
+  .links { margin-top: 18px; text-align: center; font-size: 12px; color: var(--muted); line-height: 1.9; }
+  .links a { color: var(--blue); text-decoration: none; }
+  .links a:hover { text-decoration: underline; }
+  .error {
+    background: #4a1a1a; border: 1px solid var(--red); color: var(--red);
+    border-radius: 5px; padding: 8px 12px; font-size: 12px; margin-bottom: 14px;
+  }
+  .info {
+    background: #1a2a3a; border: 1px solid var(--accent); color: var(--blue);
+    border-radius: 5px; padding: 8px 12px; font-size: 12px; margin-bottom: 14px;
+  }
+  .otp-input {
+    letter-spacing: 8px; font-size: 22px; text-align: center; font-weight: 700;
+  }
+
+  /* ── COOKIE BANNER ── */
+  #cookie-banner {
+    display: none;
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 9999;
+    background: #1c2128; border-top: 1px solid var(--border);
+    padding: 14px 24px;
+    flex-wrap: wrap; align-items: center; gap: 12px;
+  }
+  #cookie-banner.show { display: flex; }
+  #cookie-banner p { flex: 1; font-size: 12px; color: var(--muted); min-width: 200px; }
+  #cookie-banner a { color: var(--blue); }
+  #cookie-accept {
+    padding: 7px 18px; background: var(--accent); color: #fff;
+    border: none; border-radius: 5px; font-family: inherit;
+    font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+
+<!-- Cookie consent banner (GDPR) -->
+<div id="cookie-banner">
+  <p>
+    We use strictly necessary cookies for authentication and language preferences.
+    No tracking or advertising cookies are used.
+    By continuing to use this service you accept their use.
+  </p>
+  <button id="cookie-accept" onclick="acceptCookies()">Got it</button>
+</div>
+<script>
+  (function() {
+    function getCookie(name) {
+      return document.cookie.split(';').some(c => c.trim().startsWith(name + '='));
+    }
+    if (!getCookie('cookie_consent')) {
+      document.getElementById('cookie-banner').classList.add('show');
+    }
+  })();
+  function acceptCookies() {
+    document.cookie = 'cookie_consent=1; max-age=' + (60*60*24*365) + '; path=/; SameSite=Lax';
+    document.getElementById('cookie-banner').classList.remove('show');
+  }
+</script>
+
+<div class="card">
+  <div class="brand">
+    <div class="brand-title">TradingBotV3</div>
+    <div class="brand-sub">Neutral Grid</div>
+  </div>
+  {% if error %}
+  <div class="error">{{ error }}</div>
+  {% endif %}
+  {% if message %}
+  <div class="info">{{ message }}</div>
+  {% endif %}
+  {% block content %}{% endblock %}
+</div>
+</body>
+</html>

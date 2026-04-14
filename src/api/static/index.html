@@ -1,0 +1,1119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TradingBotV3 — Neutral Grid Dashboard</title>
+<style>
+  :root {
+    --bg:       #0d1117;
+    --surface:  #161b22;
+    --border:   #21262d;
+    --text:     #c9d1d9;
+    --muted:    #8b949e;
+    --green:    #3fb950;
+    --green-dim:#1a4a25;
+    --red:      #f85149;
+    --red-dim:  #4a1a1a;
+    --blue:     #58a6ff;
+    --yellow:   #d29922;
+    --purple:   #bc8cff;
+    --accent:   #1f6feb;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
+
+  /* ── HEADER ── */
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; background: var(--surface);
+    border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 100;
+  }
+  .header-title { font-size: 15px; font-weight: 700; color: var(--blue); letter-spacing: 0.5px; }
+  .header-meta { display: flex; gap: 24px; }
+  .header-stat { display: flex; flex-direction: column; align-items: flex-end; }
+  .header-stat .label { font-size: 10px; color: var(--muted); text-transform: uppercase; }
+  .header-stat .val { font-size: 14px; font-weight: 600; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; margin-right: 6px; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  /* ── OFFLINE BANNER ── */
+  #offline-banner {
+    display: none;
+    align-items: center; justify-content: center; gap: 10px;
+    background: #4a0d0d; border-bottom: 2px solid var(--red);
+    padding: 10px 20px; font-size: 13px; font-weight: 600;
+    color: #ff6b6b; letter-spacing: 0.02em; position: sticky; top: 49px; z-index: 99;
+  }
+  #offline-banner.visible { display: flex; }
+  #offline-banner .blink { animation: pulse 1s infinite; }
+  #offline-banner .offline-detail { font-weight: 400; color: #c97070; margin-left: 4px; }
+
+  /* ── SYMBOL PILLS (header) ── */
+  .hdr-pills { display: flex; gap: 8px; align-items: center; }
+  .sym-pill {
+    display: flex; flex-direction: column; gap: 3px;
+    background: #1c2128; border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 12px; min-width: 130px;
+  }
+  .sym-pill-name {
+    font-size: 11px; font-weight: 700; color: var(--blue);
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .sym-pill-row { display: flex; justify-content: space-between; gap: 10px; }
+  .sym-pill-stat { display: flex; flex-direction: column; }
+  .sym-pill-stat .sp-lbl { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.3px; }
+  .sym-pill-stat .sp-val { font-size: 12px; font-weight: 700; }
+
+  /* ── MAIN GRID ── */
+  .main { padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; }
+
+  /* ── SYMBOL CARD ── */
+  .symbol-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+  }
+  .card-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px; border-bottom: 1px solid var(--border); background: #1c2128;
+  }
+  .symbol-name { font-size: 16px; font-weight: 700; color: var(--blue); }
+  .symbol-price { font-size: 18px; font-weight: 700; color: var(--text); margin-left: 14px; letter-spacing: 0.3px; }
+  .symbol-price-time { font-size: 13px; color: var(--muted); margin-left: 6px; align-self: flex-end; padding-bottom: 2px; }
+  .badges { display: flex; gap: 8px; }
+  .badge {
+    padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; text-transform: uppercase;
+  }
+  .badge-mr-good    { background: #1a3a1a; color: var(--green); }
+  .badge-mr-weak    { background: #3a2a0a; color: var(--yellow); }
+  .badge-trend-up   { background: #0a2a3a; color: var(--blue); }
+  .badge-trend-down { background: var(--red-dim); color: var(--red); }
+  .badge-stress     { background: #3a0a3a; color: var(--purple); }
+  .badge-normal     { background: #1a3a1a; color: var(--green); }
+  .badge-reduced    { background: #3a2a0a; color: var(--yellow); }
+  .badge-frozen     { background: #1a2a3a; color: var(--blue); }
+  .badge-defensive  { background: var(--red-dim); color: var(--red); }
+  .badge-shutdown   { background: #3a0a0a; color: var(--red); border: 1px solid var(--red); }
+
+  /* ── STATS ROW ── */
+  .stats-row { display: flex; gap: 0; border-bottom: 1px solid var(--border); }
+  .stat-box { flex: 1; padding: 10px 14px; border-right: 1px solid var(--border); }
+  .stat-box:last-child { border-right: none; }
+  .stat-box .s-label { font-size: 10px; color: var(--muted); text-transform: uppercase; margin-bottom: 3px; }
+  .stat-box .s-val { font-size: 15px; font-weight: 600; }
+
+  /* ── GRID BODY ── */
+  .card-body { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+  .grid-panel { padding: 12px 16px; }
+  .grid-panel.left  { border-right: 1px solid var(--border); }
+  .panel-title { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+
+  /* ── LEVEL ROWS ── */
+  .level-list { display: flex; flex-direction: column; gap: 4px; }
+  .level-row {
+    display: grid; grid-template-columns: 70px 1fr 70px 55px 52px;
+    align-items: center; gap: 6px; padding: 5px 8px; border-radius: 4px;
+    transition: background 0.2s;
+  }
+  .level-row.bid  { background: #0d1f0d; border: 1px solid #1a3a1a; }
+  .level-row.ask  { background: #1f0d0d; border: 1px solid #3a1a1a; }
+  .level-row.filled-bid { background: #1a3f1a; border: 1px solid var(--green); }
+  .level-row.filled-ask { background: #3f1a1a; border: 1px solid var(--red); }
+  .level-row.pending { opacity: 0.5; }
+  .lvl-price { font-weight: 700; font-size: 13px; }
+  .lvl-price.bid { color: var(--green); }
+  .lvl-price.ask { color: var(--red); }
+  .lvl-bar-wrap { position: relative; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+  .lvl-bar { height: 100%; border-radius: 3px; transition: width 0.3s; }
+  .lvl-bar.bid { background: var(--green); }
+  .lvl-bar.ask { background: var(--red); }
+  .lvl-size  { color: var(--muted); font-size: 11px; text-align: right; }
+  .lvl-status { font-size: 10px; text-align: right; text-transform: uppercase; font-weight: 600; }
+  .lvl-status.open    { color: var(--blue); }
+  .lvl-status.filled  { color: var(--green); }
+  .lvl-status.pending { color: var(--muted); }
+  .lvl-status.cancelled { color: var(--red); }
+
+  /* Mid price indicator */
+  .mid-indicator {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 8px; margin: 6px 0;
+    background: #1c2128; border: 1px solid var(--accent);
+    border-radius: 4px; font-size: 12px;
+  }
+  .mid-indicator .mid-label { color: var(--muted); }
+  .mid-indicator .mid-price { color: var(--blue); font-weight: 700; font-size: 14px; }
+  .mid-indicator .spread    { color: var(--muted); font-size: 11px; margin-left: auto; }
+
+  /* ── PNL PANEL ── */
+  .pnl-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; border-top: 1px solid var(--border); }
+  .pnl-box { padding: 10px 14px; border-right: 1px solid var(--border); }
+  .pnl-box:last-child { border-right: none; }
+  .pnl-box .p-label { font-size: 10px; color: var(--muted); text-transform: uppercase; margin-bottom: 3px; }
+  .pnl-box .p-val   { font-size: 16px; font-weight: 700; }
+  .pos { color: var(--green); } .neg { color: var(--red); } .neu { color: var(--text); }
+
+  /* ── PNL CHART ── */
+  .chart-panel { padding: 12px 16px; border-top: 1px solid var(--border); }
+  .chart-wrap  { position: relative; height: 90px; }
+  canvas.pnl-chart { width: 100%; height: 100%; }
+
+  /* ── FILLS TABLE ── */
+  .fills-panel { border-top: 1px solid var(--border); padding: 12px 16px; }
+  .fills-title { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .fills-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .fills-table th { color: var(--muted); font-weight: 400; text-align: left; padding: 3px 8px; border-bottom: 1px solid var(--border); text-transform: uppercase; font-size: 10px; }
+  .fills-table td { padding: 4px 8px; border-bottom: 1px solid #1c2128; }
+  .fills-table tr:last-child td { border-bottom: none; }
+  .fill-buy  { color: var(--green); font-weight: 600; }
+  .fill-sell { color: var(--red);   font-weight: 600; }
+  .fill-empty { color: var(--muted); text-align: center; padding: 12px; }
+
+  /* ── FOOTER ── */
+  .footer { text-align: center; padding: 10px; color: var(--muted); font-size: 11px; border-top: 1px solid var(--border); }
+  #last-update { color: var(--blue); }
+
+  /* ── STRATEGY PANEL ── */
+  .strategy-panel {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+  }
+  .strategy-panel .sp-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px; border-bottom: 1px solid var(--border); background: #1c2128;
+  }
+  .strategy-panel .sp-title { font-size: 13px; font-weight: 700; color: var(--blue); }
+  .strategy-panel .sp-name  { font-size: 11px; color: var(--yellow); margin-left: 10px; }
+  .strategy-panel .sp-body  { padding: 14px 16px; display: grid; grid-template-columns: repeat(4,1fr); gap: 10px 16px; }
+  .sp-field label { display: block; font-size: 10px; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.05em; }
+  .sp-field input[type="number"], .sp-field input[type="text"] {
+    width: 100%; background: #0d1117; color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 4px 8px; font-size: 13px; font-family: inherit;
+  }
+  .sp-field input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  .sp-footer { padding: 10px 16px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 10px; }
+  .sp-btn { padding: 5px 14px; border-radius: 4px; border: none; cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 600; }
+  .sp-btn-save   { background: var(--accent); color: #fff; }
+  .sp-btn-reload { background: #21262d; color: var(--text); }
+  .sp-msg { font-size: 11px; color: var(--green); }
+
+  /* ── PER-SYMBOL STRATEGY PANELS ── */
+  .sym-strat-container { display: flex; gap: 16px; flex-wrap: wrap; }
+  .sym-strat-panel {
+    flex: 1; min-width: 380px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+  }
+  .sym-strat-panel .sp-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px; border-bottom: 1px solid var(--border); background: #1c2128;
+  }
+  .sym-strat-panel .sp-symbol { font-size: 14px; font-weight: 700; letter-spacing: 0.5px; }
+  .sym-strat-panel .sp-badge {
+    font-size: 9px; padding: 2px 6px; border-radius: 8px; font-weight: 600; text-transform: uppercase;
+  }
+  .sp-badge-override { background: #1f3a6f; color: var(--blue); }
+  .sp-badge-base     { background: #21262d; color: var(--muted); }
+  .sym-strat-panel .sp-body { padding: 12px 16px; display: grid; grid-template-columns: repeat(3,1fr); gap: 8px 14px; }
+  .sp-field-wrap { position: relative; }
+  .sp-field-wrap .sp-src {
+    position: absolute; top: 0; right: 0; font-size: 8px; text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .sp-src-override { color: var(--blue); }
+  .sp-src-base     { color: var(--muted); }
+  .sym-strat-panel .sp-footer { padding: 8px 16px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 10px; }
+  .sp-field select {
+    width: 100%; background: #0d1117; color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 4px 8px; font-size: 13px; font-family: inherit;
+  }
+
+  /* ── REASON TAGS ── */
+  .reasons { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .reason-tag { padding: 1px 7px; background: #21262d; border-radius: 10px; font-size: 10px; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-title"><span class="dot"></span>TradingBotV3 — Neutral Grid</div>
+  <div class="header-meta">
+    <div class="header-stat">
+      <span class="label">Mode</span>
+      <span class="val" id="hdr-mode">—</span>
+    </div>
+    <div class="header-stat">
+      <span class="label">Uptime</span>
+      <span class="val" id="hdr-uptime">—</span>
+    </div>
+    <div style="width:1px;height:32px;background:var(--border);margin:0 4px"></div>
+    <div class="hdr-pills" id="hdr-pills">
+      <!-- populated by JS per symbol -->
+    </div>
+    <!-- keep hidden aggregates for backward compat -->
+    <span id="hdr-pnl" style="display:none"></span>
+    <span id="hdr-fills" style="display:none"></span>
+  </div>
+  <div style="display:flex;flex-direction:column;align-items:flex-end;margin-left:16px;gap:5px">
+    <button id="btn-daily-close" onclick="dailyClose()" style="
+      background:#2563eb;color:#fff;border:none;border-radius:4px;
+      padding:5px 12px;font-size:13px;cursor:pointer;
+      font-family:inherit;letter-spacing:0.03em;
+    ">☾ Daily Close</button>
+    <button id="btn-restart" onclick="restartBot()" style="
+      background:#c0392b;color:#fff;border:none;border-radius:4px;
+      padding:5px 12px;font-size:13px;cursor:pointer;
+      font-family:inherit;letter-spacing:0.03em;
+    ">↺ Reset Session</button>
+    <button id="btn-restart-worker" onclick="restartWorker()" style="
+      background:#7c3aed;color:#fff;border:none;border-radius:4px;
+      padding:5px 12px;font-size:13px;cursor:pointer;
+      font-family:inherit;letter-spacing:0.03em;
+    ">⟳ Restart Bot</button>
+    <div style="display:flex;gap:6px;align-items:center">
+      <label style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em">Exchange</label>
+      <select id="sel-exchange" onchange="setExchange(this.value)" style="
+        background:#1c2128;color:var(--text);border:1px solid var(--border);border-radius:4px;
+        padding:3px 8px;font-size:12px;cursor:pointer;font-family:inherit;
+      ">
+        <option value="coinbase">Coinbase</option>
+        <option value="bybit">Bybit</option>
+      </select>
+    </div>
+    <button id="btn-skip-close" onclick="skipDailyClose()" style="
+      background:#7f4f00;color:#fff;border:none;border-radius:4px;
+      padding:5px 12px;font-size:12px;cursor:pointer;
+      font-family:inherit;letter-spacing:0.03em;
+    ">⏭ Skip Close · <span id="hdr-close-countdown">—</span></button>
+  </div>
+</div>
+
+<div id="offline-banner">
+  <span class="blink">⚠</span>
+  <span>WORKER OFFLINE — bot is not trading</span>
+  <span class="offline-detail" id="offline-since"></span>
+</div>
+
+<div class="main" id="symbols-container">
+  <div style="color:var(--muted);text-align:center;padding:40px">Connecting to bot...</div>
+</div>
+
+<div class="main" style="padding-top:0">
+  <!-- Per-symbol strategy panels — populated by JS -->
+  <div id="sym-strategy-panels"></div>
+</div>
+
+<div class="footer">
+  Auto-refresh every 2s &nbsp;|&nbsp; Last update: <span id="last-update">—</span>
+</div>
+
+<script>
+// ── CONFIG ──────────────────────────────────────────────
+const API_BASE = '';
+const POLL_MS  = 2000;
+const MAX_FILLS_DISPLAY = 15;
+
+function fmtCountdown(targetIso) {
+  if (!targetIso) return '—';
+  const diff = Math.max(0, new Date(targetIso) - Date.now());
+  const h = Math.floor(diff / 3600000);
+  const m = Math.floor((diff % 3600000) / 60000);
+  const s = Math.floor((diff % 60000) / 1000);
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+async function skipDailyClose() {
+  const btn = document.getElementById('btn-skip-close');
+  if (!btn) return;
+  if (!confirm('Skip tonight\'s automatic daily close? The bot will keep running past midnight without resetting.')) return;
+  btn.disabled = true;
+  try {
+    const exchange = _getExchange();
+    const resp = await fetch(`${API_BASE}/api/skip-daily-close`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ exchange }),
+    });
+    if (!resp.ok) throw new Error('status ' + resp.status);
+    btn.style.background = '#2e7d32';
+    const span = document.getElementById('hdr-close-countdown');
+    if (span) span.textContent = 'SKIPPED';
+    setTimeout(() => { btn.disabled = false; btn.style.background = '#7f4f00'; }, 5000);
+  } catch (e) {
+    setTimeout(() => { btn.disabled = false; }, 3000);
+  }
+}
+
+function _getExchange() {
+  return (document.getElementById('sel-exchange')?.value || '').toLowerCase();
+}
+
+async function dailyClose() {
+  const btn = document.getElementById('btn-daily-close');
+  if (!btn) return;
+  if (!confirm('Simular cierre de día? Cierra la sesión actual, reconcilia capital y abre nueva sesión.')) return;
+  btn.disabled = true;
+  btn.textContent = 'Cerrando…';
+  try {
+    const exchange = _getExchange();
+    const resp = await fetch(`${API_BASE}/api/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ triggered_by: 'daily_close_manual', exchange, reset_type: 'daily_close' }),
+    });
+    if (!resp.ok) throw new Error('status ' + resp.status);
+    btn.textContent = '✓ Closed';
+    setTimeout(() => { btn.disabled = false; btn.textContent = '☾ Daily Close'; }, 3000);
+  } catch (e) {
+    btn.textContent = 'Error';
+    setTimeout(() => { btn.disabled = false; btn.textContent = '☾ Daily Close'; }, 3000);
+  }
+}
+
+async function restartBot() {
+  const btn = document.getElementById('btn-restart');
+  if (!btn) return;
+  const mode = (document.getElementById('hdr-mode')?.textContent || '').toLowerCase();
+  const msg = mode === 'live'
+    ? 'LIVE MODE: Cancel all open orders and rebuild grid from current account balances?'
+    : 'Reset session: close current session and start fresh with session capital. Continue?';
+  if (!confirm(msg)) return;
+  btn.disabled = true;
+  btn.textContent = 'Resetting…';
+  try {
+    const exchange = _getExchange();
+    const resp = await fetch(`${API_BASE}/api/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ triggered_by: 'Abraham', exchange, reset_type: 'hard' }),
+    });
+    if (!resp.ok) throw new Error('status ' + resp.status);
+    btn.textContent = '✓ Reset';
+    setTimeout(() => { btn.disabled = false; btn.textContent = '↺ Reset Session'; }, 3000);
+  } catch (e) {
+    btn.textContent = 'Error';
+    setTimeout(() => { btn.disabled = false; btn.textContent = '↺ Reset Session'; }, 3000);
+  }
+}
+
+async function restartWorker() {
+  const btn = document.getElementById('btn-restart-worker');
+  if (!btn) return;
+  if (!confirm('Restart bot process? Session will be resumed (no data loss).')) return;
+  btn.disabled = true;
+  btn.textContent = 'Restarting…';
+  try {
+    const exchange = _getExchange();
+    const resp = await fetch(`${API_BASE}/api/restart-worker`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ exchange }),
+    });
+    if (!resp.ok) throw new Error('status ' + resp.status);
+    btn.textContent = '✓ Restarted';
+    setTimeout(() => { btn.disabled = false; btn.textContent = '⟳ Restart Bot'; }, 5000);
+  } catch (e) {
+    btn.textContent = 'Error';
+    setTimeout(() => { btn.disabled = false; btn.textContent = '⟳ Restart Bot'; }, 3000);
+  }
+}
+
+// ── EXCHANGE SELECTOR ────────────────────────────────────
+async function loadExchange() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/exchange`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const sel = document.getElementById('sel-exchange');
+    if (sel) sel.value = data.exchange;
+    // Keep strategy panel in sync with active exchange
+    loadStrategy(data.exchange);
+  } catch(e) {}
+}
+
+async function setExchange(name) {
+  const sel = document.getElementById('sel-exchange');
+  try {
+    const resp = await fetch(`${API_BASE}/api/exchange`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ exchange: name }),
+    });
+    if (!resp.ok) throw new Error('status ' + resp.status);
+    loadStrategy(name); // sync strategy panel to new exchange
+    if (confirm(`Exchange cambiado a ${name.toUpperCase()}.\n¿Reiniciar el worker ahora para aplicar?`)) {
+      await fetch(`${API_BASE}/api/restart-worker`, { method: 'POST' });
+    }
+  } catch(e) {
+    alert('Error al cambiar exchange: ' + e.message);
+    loadExchange(); // revert selector
+  }
+}
+
+// ── PNL HISTORY per symbol ───────────────────────────────
+const pnlHistory = {};     // { symbol: [{t, v}] }
+const MAX_PNL_POINTS = 120;
+
+// ── FILLS CACHE per symbol ───────────────────────────────
+const fillsCache = {};       // { symbol: [{...}] }
+const sessionIdCache = {};   // { symbol: session_id } — cleared when session changes
+
+// ── CHART HELPERS ────────────────────────────────────────
+function drawPnlChart(canvas, symbol) {
+  const hist = pnlHistory[symbol] || [];
+  const ctx  = canvas.getContext('2d');
+  const W = canvas.width  = canvas.offsetWidth;
+  const H = canvas.height = canvas.offsetHeight;
+  ctx.clearRect(0, 0, W, H);
+  if (hist.length < 2) return;
+
+  const vals = hist.map(p => p.v);
+  const minV = Math.min(...vals);
+  const maxV = Math.max(...vals);
+  const range = maxV - minV || 0.0001;
+
+  const px = (i) => (i / (hist.length - 1)) * (W - 2) + 1;
+  const py = (v) => H - 2 - ((v - minV) / range) * (H - 4);
+
+  // Zero line
+  const zeroY = py(0);
+  ctx.beginPath(); ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
+  ctx.moveTo(0, zeroY); ctx.lineTo(W, zeroY); ctx.stroke();
+
+  // Fill area
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  const lastVal = hist[hist.length - 1].v;
+  if (lastVal >= 0) {
+    grad.addColorStop(0, 'rgba(63,185,80,0.3)');
+    grad.addColorStop(1, 'rgba(63,185,80,0)');
+  } else {
+    grad.addColorStop(0, 'rgba(248,81,73,0)');
+    grad.addColorStop(1, 'rgba(248,81,73,0.3)');
+  }
+  ctx.beginPath();
+  ctx.moveTo(px(0), py(hist[0].v));
+  for (let i = 1; i < hist.length; i++) ctx.lineTo(px(i), py(hist[i].v));
+  ctx.lineTo(px(hist.length - 1), H);
+  ctx.lineTo(px(0), H);
+  ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  ctx.strokeStyle = lastVal >= 0 ? '#3fb950' : '#f85149';
+  ctx.lineWidth = 1.5;
+  ctx.moveTo(px(0), py(hist[0].v));
+  for (let i = 1; i < hist.length; i++) ctx.lineTo(px(i), py(hist[i].v));
+  ctx.stroke();
+
+  // Current value label
+  const lv = lastVal.toFixed(4);
+  ctx.font = '10px SF Mono, monospace';
+  ctx.fillStyle = lastVal >= 0 ? '#3fb950' : '#f85149';
+  ctx.fillText((lastVal >= 0 ? '+' : '') + lv, 4, 12);
+}
+
+// ── FORMATTERS ───────────────────────────────────────────
+function fmt(n, dec=4) {
+  const v = parseFloat(n);
+  if (isNaN(v)) return '—';
+  return v.toFixed(dec);
+}
+function fmtPrice(n) {
+  const v = parseFloat(n);
+  if (isNaN(v)) return '—';
+  if (v >= 1000) return v.toFixed(2);
+  if (v >= 1)    return v.toFixed(4);
+  if (v >= 0.01) return v.toFixed(6);
+  return v.toFixed(8);
+}
+function fmtPnl(n) {
+  const v = parseFloat(n);
+  if (isNaN(v)) return '<span class="neu">—</span>';
+  const cls = v > 0.00001 ? 'pos' : v < -0.00001 ? 'neg' : 'neu';
+  return `<span class="${cls}">${v >= 0 ? '+' : ''}${v.toFixed(4)}</span>`;
+}
+function fmtUptime(secs) {
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = Math.floor(secs % 60);
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+function regimeBadgeClass(regime) {
+  const map = {
+    'MR_GOOD':'mr-good','MR_WEAK':'mr-weak',
+    'TREND_UP':'trend-up','TREND_DOWN':'trend-down','STRESS':'stress'
+  };
+  return map[regime] || 'mr-good';
+}
+function riskBadgeClass(mode) {
+  const map = {
+    'NORMAL':'normal','REDUCED':'reduced','FROZEN':'frozen',
+    'DEFENSIVE_UNWIND':'defensive','FLATTEN':'shutdown','SHUTDOWN':'shutdown'
+  };
+  return map[mode] || 'normal';
+}
+function timeAgo(isoStr) {
+  if (!isoStr) return '';
+  const diff = (Date.now() - new Date(isoStr)) / 1000;
+  if (diff < 60) return `${Math.round(diff)}s ago`;
+  if (diff < 3600) return `${Math.round(diff/60)}m ago`;
+  return `${Math.round(diff/3600)}h ago`;
+}
+
+// ── LEVEL ROW HTML ────────────────────────────────────────
+function levelRowHtml(lvl, side, maxSize) {
+  const pct = maxSize > 0 ? Math.min(100, (parseFloat(lvl.size_quote) / maxSize) * 100) : 0;
+  const filled = lvl.status === 'filled';
+  const pending = lvl.status === 'pending';
+  const rowCls = filled ? `filled-${side}` : (pending ? 'pending ' + side : side);
+  let openedAt = '—';
+  if (lvl.opened_at && lvl.status === 'open') {
+    const t = new Date(lvl.opened_at);
+    openedAt = t.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  }
+  return `
+  <div class="level-row ${rowCls}">
+    <span class="lvl-price ${side}">${fmtPrice(lvl.price)}</span>
+    <div class="lvl-bar-wrap">
+      <div class="lvl-bar ${side}" style="width:${pct}%"></div>
+    </div>
+    <span class="lvl-size">$${fmt(lvl.size_quote,2)}</span>
+    <span class="lvl-status ${lvl.status}">${lvl.status}</span>
+    <span style="font-size:11px;color:var(--muted);text-align:right">${openedAt}</span>
+  </div>`;
+}
+
+// ── SYMBOL CARD HTML ─────────────────────────────────────
+function symbolCardHtml(sym) {
+  const id = sym.product_id.replace('-','_');
+  return `
+  <div class="symbol-card" id="card-${id}">
+    <div class="card-header">
+      <div style="display:flex;align-items:baseline;gap:0">
+        <span class="symbol-name">${sym.product_id}</span>
+        <span class="symbol-price" id="hdr-price-${id}">—</span>
+        <span class="symbol-price-time" id="hdr-price-time-${id}">—</span>
+        <span style="font-size:10px;color:var(--muted);margin-left:10px;align-self:center" id="session-id-${id}" title="Session ID">${sym.session_id ? 'sid:' + sym.session_id.slice(0,8) : ''}</span>
+      </div>
+      <div class="badges">
+        <span class="badge badge-${regimeBadgeClass(sym.regime)}" id="badge-regime-${id}">${sym.regime}</span>
+        <span class="badge badge-${riskBadgeClass(sym.risk_mode)}" id="badge-risk-${id}">${sym.risk_mode}</span>
+      </div>
+    </div>
+    <div class="stats-row">
+      <div class="stat-box"><div class="s-label">Mid Price</div><div class="s-val" id="mid-${id}">—</div></div>
+      <div class="stat-box"><div class="s-label">Spread</div><div class="s-val" id="spread-${id}">—</div></div>
+      <div class="stat-box"><div class="s-label">RSI(14)</div><div class="s-val" id="rsi-${id}">—</div></div>
+      <div class="stat-box"><div class="s-label">Anchor</div><div class="s-val" id="anchor-${id}">—</div></div>
+      <div class="stat-box"><div class="s-label">Rebalances</div><div class="s-val" id="rebal-${id}">—</div></div>
+      <div class="stat-box"><div class="s-label">Total Fills</div><div class="s-val" id="tfills-${id}">—</div></div>
+    </div>
+    <div class="card-body">
+      <div class="grid-panel left">
+        <div class="panel-title">Ask Levels (Sell)</div>
+        <div class="level-list" id="asks-${id}"></div>
+        <div class="mid-indicator">
+          <span class="mid-label">MID</span>
+          <span class="mid-price" id="mid2-${id}">—</span>
+          <span class="spread" id="spread2-${id}">spread —</span>
+        </div>
+        <div class="level-list" id="bids-${id}"></div>
+        <div style="margin-top:6px;font-size:10px;color:var(--muted)" id="reasons-${id}"></div>
+      </div>
+      <div class="grid-panel">
+        <div class="panel-title">Inventory</div>
+        <div class="level-list" style="gap:6px">
+          <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)">
+            <span style="color:var(--muted)">Base</span>
+            <span id="base-${id}">—</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)">
+            <span style="color:var(--muted)">Base (USD)</span>
+            <span id="base-usd-${id}">—</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)">
+            <span style="color:var(--muted)">Quote</span>
+            <span id="quote-${id}">—</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)">
+            <span style="color:var(--muted)">Equity</span>
+            <span id="equity-${id}" style="font-weight:700">—</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)">
+            <span style="color:var(--muted)">Reserve (Caja)</span>
+            <span id="reserve-${id}" style="font-weight:700">—</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;padding:5px 0">
+            <span style="color:var(--muted)">Total Wallet</span>
+            <span id="wallet-${id}" style="font-weight:700">—</span>
+          </div>
+        </div>
+        <div class="panel-title" style="margin-top:12px">Grid Status</div>
+        <div class="level-list" style="gap:6px">
+          <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)">
+            <span style="color:var(--green)">Open Bids</span>
+            <span id="open-bids-${id}">—</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;padding:5px 0">
+            <span style="color:var(--red)">Open Asks</span>
+            <span id="open-asks-${id}">—</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="pnl-row">
+      <div class="pnl-box"><div class="p-label">Realized PnL</div><div class="p-val" id="r-pnl-${id}">—</div></div>
+      <div class="pnl-box"><div class="p-label">Unrealized PnL</div><div class="p-val" id="u-pnl-${id}">—</div></div>
+      <div class="pnl-box"><div class="p-label">Total Equity</div><div class="p-val" id="eq-${id}">—</div></div>
+      <div class="pnl-box"><div class="p-label">Net PnL</div><div class="p-val" id="net-pnl-${id}">—</div></div>
+    </div>
+    <div class="chart-panel">
+      <div class="panel-title">Realized PnL History</div>
+      <div class="chart-wrap"><canvas class="pnl-chart" id="chart-${id}"></canvas></div>
+    </div>
+    <div class="fills-panel">
+      <div class="fills-title">Recent Fills</div>
+      <table class="fills-table">
+        <thead><tr>
+          <th>Time</th><th>Side</th><th>Price</th><th>Size</th><th>Quote</th><th>Fee</th><th>Level</th>
+        </tr></thead>
+        <tbody id="fills-tbody-${id}"></tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+// ── UPDATE SYMBOL ─────────────────────────────────────────
+function updateSymbol(sym, fills) {
+  const id = sym.product_id.replace('-','_');
+  const product = sym.product_id;
+
+  // Badges
+  const brEl = document.getElementById(`badge-regime-${id}`);
+  const bkEl = document.getElementById(`badge-risk-${id}`);
+  if (brEl) { brEl.textContent = sym.regime; brEl.className = `badge badge-${regimeBadgeClass(sym.regime)}`; }
+  if (bkEl) { bkEl.textContent = sym.risk_mode; bkEl.className = `badge badge-${riskBadgeClass(sym.risk_mode)}`; }
+
+  // Header price + timestamp + session_id
+  setText(`hdr-price-${id}`, '$' + fmtPrice(sym.mid_price));
+  const pt = sym.price_time ? new Date(sym.price_time) : null;
+  setText(`hdr-price-time-${id}`, pt ? pt.toLocaleTimeString() : '—');
+  setText(`session-id-${id}`, sym.session_id ? 'sid:' + sym.session_id.slice(0, 8) : '');
+
+  // Stats
+  setText(`mid-${id}`,    fmtPrice(sym.mid_price));
+  setText(`spread-${id}`, fmt(sym.spread_bps, 4) + ' bps');
+  const rsi = parseFloat(sym.rsi);
+  const rsiEl = document.getElementById(`rsi-${id}`);
+  if (rsiEl) {
+    rsiEl.textContent = fmt(sym.rsi, 1);
+    rsiEl.style.color = rsi > 70 ? 'var(--red)' : rsi < 30 ? 'var(--green)' : 'var(--text)';
+  }
+  setText(`anchor-${id}`, fmtPrice(sym.mid_anchor));
+  setText(`rebal-${id}`,  sym.rebalance_count);
+  setText(`tfills-${id}`, sym.total_fills);
+
+  // Mid indicator
+  setText(`mid2-${id}`,   fmtPrice(sym.mid_price));
+  setText(`spread2-${id}`, `spread ${fmt(sym.spread_bps, 4)} bps`);
+
+  // Inventory
+  setText(`base-${id}`,     fmt(sym.base_inventory, 8) + ' ' + product.split('-')[0]);
+  setText(`base-usd-${id}`, '$' + fmt(sym.base_inventory_usd, 2));
+  setText(`quote-${id}`,    '$' + fmt(sym.quote_inventory, 2));
+  setText(`equity-${id}`,   '$' + fmt(sym.total_equity, 2));
+  const reserve = parseFloat(sym.reserve_usd || '0');
+  setText(`reserve-${id}`,  '$' + fmt(reserve, 2));
+  const wallet = parseFloat(sym.total_equity) + reserve;
+  setText(`wallet-${id}`,   '$' + fmt(wallet, 2));
+
+  // Grid counts
+  setText(`open-bids-${id}`, sym.open_bid_count + ' / ' + sym.bid_levels.length);
+  setText(`open-asks-${id}`, sym.open_ask_count + ' / ' + sym.ask_levels.length);
+
+  // PnL
+  const realized = parseFloat(sym.realized_pnl);
+  const unrealized = parseFloat(sym.unrealized_pnl);
+  const net = realized + unrealized;
+  setHtml(`r-pnl-${id}`,   fmtPnl(sym.realized_pnl));
+  setHtml(`u-pnl-${id}`,   fmtPnl(sym.unrealized_pnl));
+  setHtml(`eq-${id}`,      `<span class="neu">$${fmt(sym.total_equity, 2)}</span>`);
+  setHtml(`net-pnl-${id}`, fmtPnl(net));
+
+  // Reason tags
+  const reasons = [...(sym.regime_reasons || []), ...(sym.risk_reasons || [])];
+  const reasonsEl = document.getElementById(`reasons-${id}`);
+  if (reasonsEl) {
+    reasonsEl.innerHTML = reasons.length
+      ? `<div class="reasons">${reasons.map(r => `<span class="reason-tag">${r}</span>`).join('')}</div>`
+      : '';
+  }
+
+  // Grid levels
+  const asksEl = document.getElementById(`asks-${id}`);
+  const bidsEl = document.getElementById(`bids-${id}`);
+  if (asksEl && bidsEl) {
+    const maxAsk = Math.max(...sym.ask_levels.map(l => parseFloat(l.size_quote)), 0.01);
+    const maxBid = Math.max(...sym.bid_levels.map(l => parseFloat(l.size_quote)), 0.01);
+    // Asks sorted ascending (closest to mid at bottom = last in array)
+    const sortedAsks = [...sym.ask_levels].sort((a,b) => b.level_index - a.level_index);
+    asksEl.innerHTML = sortedAsks.map(l => levelRowHtml(l, 'ask', maxAsk)).join('');
+    // Bids sorted descending (closest to mid at top = first in array)
+    const sortedBids = [...sym.bid_levels].sort((a,b) => a.level_index - b.level_index);
+    bidsEl.innerHTML = sortedBids.map(l => levelRowHtml(l, 'bid', maxBid)).join('');
+  }
+
+  // PnL history
+  if (!pnlHistory[product]) pnlHistory[product] = [];
+  pnlHistory[product].push({ t: Date.now(), v: realized });
+  if (pnlHistory[product].length > MAX_PNL_POINTS) pnlHistory[product].shift();
+  const chartEl = document.getElementById(`chart-${id}`);
+  if (chartEl) drawPnlChart(chartEl, product);
+
+  // Fills table — clear cache if session changed (reset session or worker restart)
+  if (sym.session_id && sessionIdCache[product] !== sym.session_id) {
+    sessionIdCache[product] = sym.session_id;
+    fillsCache[product] = [];
+  }
+  if (fills && fills.length > 0) fillsCache[product] = fills;
+  const tbody = document.getElementById(`fills-tbody-${id}`);
+  if (tbody) {
+    const data = fillsCache[product] || [];
+    if (data.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="7" class="fill-empty">No fills yet</td></tr>`;
+    } else {
+      tbody.innerHTML = data.slice(0, MAX_FILLS_DISPLAY).map(f => `
+        <tr>
+          <td style="color:var(--muted)">${new Date(f.trade_time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})}</td>
+          <td class="fill-${f.side.toLowerCase()}">${f.side}</td>
+          <td>${fmtPrice(f.price)}</td>
+          <td>${parseFloat(f.size_base).toFixed(2)}</td>
+          <td>$${parseFloat(f.quote_value).toFixed(4)}</td>
+          <td style="color:var(--muted)">$${parseFloat(f.fee_quote).toFixed(5)}</td>
+          <td style="color:var(--muted)">${f.grid_side ?? ''}${f.level_index != null ? ' L'+f.level_index : ''}</td>
+        </tr>`).join('');
+    }
+  }
+}
+
+// ── HELPERS ───────────────────────────────────────────────
+function setText(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+function setHtml(id, val) { const el = document.getElementById(id); if (el) el.innerHTML = val; }
+
+// ── HEADER SYMBOL PILLS ───────────────────────────────────
+// Cache for pnl-since-uptime-start, fetched alongside poll
+let _pnlCache = {};
+
+async function fetchPnl(exchange) {
+  try {
+    const resp = await fetch(`${API_BASE}/api/pnl${exchange ? '?exchange=' + exchange : ''}`);
+    if (resp.ok) _pnlCache = await resp.json();
+  } catch(_) {}
+}
+
+function _pnlFmt(val) {
+  if (val == null) return '—';
+  const n = parseFloat(val);
+  const sign = n >= 0 ? '+' : '';
+  const color = n > 0.00001 ? 'var(--green)' : n < -0.00001 ? 'var(--red)' : 'var(--text)';
+  return `<span style="color:${color}">${sign}${n.toFixed(4)}</span>`;
+}
+
+function updateHeaderPills(symbols) {
+  const container = document.getElementById('hdr-pills');
+  if (!container || !symbols) return;
+
+  symbols.forEach(sym => {
+    const id = sym.product_id.replace('-', '_');
+    const pillId = `hdr-pill-${id}`;
+    const realized  = parseFloat(sym.realized_pnl || '0');
+    const unrealized = parseFloat(sym.unrealized_pnl || '0');
+    const equity    = parseFloat(sym.total_equity || '0');
+    const fills     = sym.total_fills ?? '—';
+    const netPnl    = realized + unrealized;
+    const netColor  = netPnl > 0.00001 ? 'var(--green)' : netPnl < -0.00001 ? 'var(--red)' : 'var(--text)';
+    const netSign   = netPnl >= 0 ? '+' : '';
+
+    // Last close = equity delta of the last closed session (from /api/pnl)
+    const sinceClose = _pnlFmt(_pnlCache[sym.product_id]?.pnl_last_close ?? null);
+    // Uptime = cumulative equity delta of all sessions since worker started (from /api/pnl)
+    const sinceStart = _pnlFmt(_pnlCache[sym.product_id]?.pnl_since_uptime_start ?? null);
+
+    let pill = document.getElementById(pillId);
+    if (!pill) {
+      pill = document.createElement('div');
+      pill.className = 'sym-pill';
+      pill.id = pillId;
+      container.appendChild(pill);
+    }
+
+    pill.innerHTML = `
+      <div class="sym-pill-name">${sym.product_id}</div>
+      <div class="sym-pill-row">
+        <div class="sym-pill-stat" style="flex:1"></div>
+        <div class="sym-pill-stat" style="flex:1"><span class="sp-lbl">Net</span></div>
+        <div class="sym-pill-stat" style="flex:1"><span class="sp-lbl">Last close</span></div>
+        <div class="sym-pill-stat" style="flex:1"><span class="sp-lbl">Uptime</span></div>
+      </div>
+      <div class="sym-pill-row">
+        <div class="sym-pill-stat" style="flex:1"><span class="sp-val" style="font-size:10px;color:var(--text);font-weight:700">PNL</span></div>
+        <div class="sym-pill-stat" style="flex:1"><span class="sp-val" style="color:${netColor}">${netSign}${netPnl.toFixed(4)}</span></div>
+        <div class="sym-pill-stat" style="flex:1"><span class="sp-val">${sinceClose}</span></div>
+        <div class="sym-pill-stat" style="flex:1"><span class="sp-val">${sinceStart}</span></div>
+      </div>
+      <div class="sym-pill-row" style="margin-top:4px;border-top:1px solid var(--border);padding-top:4px">
+        <div class="sym-pill-stat" style="flex:1"><span class="sp-lbl">Equity</span></div>
+        <div class="sym-pill-stat" style="flex:1"><span class="sp-lbl">Fills</span></div>
+      </div>
+      <div class="sym-pill-row">
+        <div class="sym-pill-stat" style="flex:1"><span class="sp-val">$${equity.toFixed(2)}</span></div>
+        <div class="sym-pill-stat" style="flex:1"><span class="sp-val">${fills}</span></div>
+      </div>`;
+  });
+}
+
+// ── MAIN POLL LOOP ────────────────────────────────────────
+let initialized = false;
+
+async function poll() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/status`);
+    if (!resp.ok) throw new Error('status ' + resp.status);
+    const data = await resp.json();
+
+    // Header
+    setText('hdr-mode',   (data.mode || '').toUpperCase());
+    setText('hdr-uptime', fmtUptime(data.uptime_seconds));
+    const totalPnl = parseFloat(data.total_realized_pnl);
+    const pnlEl = document.getElementById('hdr-pnl');
+    if (pnlEl) {
+      pnlEl.textContent = (totalPnl >= 0 ? '+' : '') + totalPnl.toFixed(4);
+      pnlEl.style.color = totalPnl > 0.00001 ? 'var(--green)' : totalPnl < -0.00001 ? 'var(--red)' : 'var(--text)';
+    }
+    setText('hdr-fills', data.total_fills);
+    const skipBtn = document.getElementById('btn-skip-close');
+    const countdownSpan = document.getElementById('hdr-close-countdown');
+    if (data.skip_daily_close) {
+      _nextCloseAt = null;
+      if (countdownSpan) countdownSpan.textContent = 'SKIPPED';
+      if (skipBtn) { skipBtn.style.background = '#2e7d32'; skipBtn.disabled = true; }
+    } else {
+      _nextCloseAt = data.next_daily_close_at || null;
+      if (countdownSpan) countdownSpan.textContent = fmtCountdown(_nextCloseAt);
+      if (skipBtn) { skipBtn.style.background = '#7f4f00'; skipBtn.disabled = false; }
+    }
+    setText('last-update', new Date().toLocaleTimeString());
+
+    // Worker liveness indicator
+    const dot = document.querySelector('.dot');
+    if (dot) {
+      dot.style.background = data.worker_alive ? 'var(--green)' : 'var(--red)';
+      dot.style.animation  = data.worker_alive ? 'pulse 2s infinite' : 'none';
+      dot.title = data.worker_alive ? 'Worker online' : 'Worker offline';
+    }
+    // Prominent offline banner
+    const banner = document.getElementById('offline-banner');
+    const offlineSince = document.getElementById('offline-since');
+    if (banner) {
+      if (!data.worker_alive) {
+        if (!banner._offlineSince) banner._offlineSince = new Date();
+        const elapsed = Math.round((Date.now() - banner._offlineSince) / 1000);
+        if (offlineSince) offlineSince.textContent = elapsed > 5 ? `(${elapsed}s ago)` : '';
+        banner.classList.add('visible');
+      } else {
+        banner._offlineSince = null;
+        banner.classList.remove('visible');
+      }
+    }
+
+    // Header pills per symbol
+    if (data.symbols) {
+      const exchange = _getExchange();
+      await fetchPnl(exchange);
+      updateHeaderPills(data.symbols);
+    }
+
+    // Build cards on first load
+    if (!initialized && data.symbols && data.symbols.length > 0) {
+      const container = document.getElementById('symbols-container');
+      container.innerHTML = data.symbols.map(s => symbolCardHtml(s)).join('');
+      initialized = true;
+    }
+
+    // Fetch fills for each symbol and update
+    if (data.symbols) {
+      await Promise.all(data.symbols.map(async (sym) => {
+        let fills = [];
+        try {
+          const fr = await fetch(`${API_BASE}/api/fills/${sym.product_id}`);
+          if (fr.ok) fills = await fr.json();
+        } catch {}
+        updateSymbol(sym, fills);
+      }));
+    }
+  } catch (e) {
+    console.warn('Poll error:', e);
+    const upEl = document.getElementById('last-update');
+    if (upEl) { upEl.textContent = 'ERROR — retrying...'; upEl.style.color = 'var(--red)'; }
+    // Show offline banner on API connection failure
+    const banner = document.getElementById('offline-banner');
+    const offlineSince = document.getElementById('offline-since');
+    if (banner) {
+      if (!banner._offlineSince) banner._offlineSince = new Date();
+      const elapsed = Math.round((Date.now() - banner._offlineSince) / 1000);
+      if (offlineSince) offlineSince.textContent = `(API unreachable · ${elapsed}s)`;
+      banner.classList.add('visible');
+    }
+  }
+}
+
+// ── PER-SYMBOL STRATEGY PANELS ──────────────────────────
+let _currentStrategyName = null;
+let _currentExchange = 'bybit';
+
+const _EDITABLE_FIELDS = [
+  { key: 'spacing_bps',                label: 'spacing_bps',           step: '1',    min: '1' },
+  { key: 'rebalance_threshold_bps',    label: 'rebalance_threshold_bps', step: '1', min: '1' },
+  { key: 'grid_levels',                label: 'grid_levels',           step: '1',    min: '1', max: '10' },
+  { key: 'level_size_quote',           label: 'level_size (USD)',      step: '0.01', min: '1' },
+  { key: 'max_inventory_ratio',        label: 'max_inventory_ratio',   step: '0.01', min: '0.1', max: '1' },
+  { key: 'stale_reprice_threshold_bps',label: 'stale_reprice_bps',     step: '1',    min: '1' },
+  { key: 'rebalance_defer_seconds',    label: 'rebal_defer (s)',       step: '1',    min: '10' },
+  { key: 'stale_order_age_seconds',    label: 'stale_age (s)',         step: '1',    min: '10' },
+  { key: 'session_capital_usd',        label: 'session_capital (USD)', step: '1',    min: '10' },
+];
+
+function _symId(sym) { return sym.replace(/[^a-zA-Z0-9]/g, '_'); }
+
+function _buildSymPanel(sym, params) {
+  const sid = _symId(sym);
+  const src = params._source || {};
+  let fieldsHtml = '';
+  for (const f of _EDITABLE_FIELDS) {
+    const val = params[f.key] ?? '';
+    const isOv = src[f.key] === 'override';
+    const srcLabel = isOv ? '<span class="sp-src sp-src-override">override</span>'
+                          : '<span class="sp-src sp-src-base">base</span>';
+    fieldsHtml += `<div class="sp-field-wrap"><div class="sp-field">
+      <label>${f.label} ${srcLabel}</label>
+      <input type="number" id="sp-${sid}-${f.key}" step="${f.step}" min="${f.min}"${f.max?' max="'+f.max+'"':''} value="${val}">
+    </div></div>`;
+  }
+  fieldsHtml += `<div class="sp-field-wrap"><div class="sp-field">
+    <label>updated_by</label>
+    <select id="sp-${sid}-updated-by">
+      <option value="abraham">abraham</option>
+      <option value="claude">claude</option>
+    </select>
+  </div></div>`;
+
+  return `<div class="sym-strat-panel" id="sp-panel-${sid}">
+    <div class="sp-header">
+      <span class="sp-symbol" style="color:var(--blue)">${sym}</span>
+      <span style="font-size:10px;color:var(--muted)">${_currentStrategyName || ''}</span>
+    </div>
+    <div class="sp-body">${fieldsHtml}</div>
+    <div class="sp-footer">
+      <button class="sp-btn sp-btn-save" onclick="saveSymStrategy('${sym}')">Guardar ${sym}</button>
+      <button class="sp-btn sp-btn-reload" onclick="loadStrategy()">Recargar</button>
+      <span class="sp-msg" id="sp-msg-${sid}"></span>
+    </div>
+  </div>`;
+}
+
+async function loadStrategy(exchange) {
+  if (!exchange) exchange = _currentExchange;
+  _currentExchange = exchange;
+  try {
+    const resp = await fetch(`${API_BASE}/api/strategies/${exchange}/resolved`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    _currentStrategyName = data.base.name;
+    const container = document.getElementById('sym-strategy-panels');
+    const syms = Object.keys(data.symbols).sort();
+    container.innerHTML = '<div class="sym-strat-container">' +
+      syms.map(sym => _buildSymPanel(sym, data.symbols[sym])).join('') +
+      '</div>';
+  } catch(e) {
+    console.warn('loadStrategy error:', e);
+  }
+}
+
+async function saveSymStrategy(sym) {
+  const sid = _symId(sym);
+  const name = _currentStrategyName || `${_currentExchange}-default`;
+  const params = {};
+  for (const f of _EDITABLE_FIELDS) {
+    const el = document.getElementById(`sp-${sid}-${f.key}`);
+    if (el && el.value !== '') params[f.key] = +el.value;
+  }
+  const updatedBy = document.getElementById(`sp-${sid}-updated-by`).value;
+  const body = { product_id: sym, updated_by: updatedBy, ...params };
+  const msgEl = document.getElementById(`sp-msg-${sid}`);
+  try {
+    const resp = await fetch(`${API_BASE}/api/strategies/${name}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    msgEl.style.color = 'var(--green)';
+    msgEl.textContent = '✓ Guardado — reinicia el worker para aplicar';
+    setTimeout(() => loadStrategy(), 1000);
+  } catch(e) {
+    msgEl.style.color = 'var(--red)';
+    msgEl.textContent = 'Error: ' + e.message;
+  }
+}
+
+// Tick the daily-close countdown every second independently of the poll
+let _nextCloseAt = null;
+setInterval(() => {
+  const span = document.getElementById('hdr-close-countdown');
+  if (span && _nextCloseAt) span.textContent = fmtCountdown(_nextCloseAt);
+}, 1000);
+
+// Start polling
+poll();
+setInterval(poll, POLL_MS);
+loadExchange(); // also calls loadStrategy() for the active exchange
+
+// Redraw charts on resize
+window.addEventListener('resize', () => {
+  Object.keys(pnlHistory).forEach(sym => {
+    const id = sym.replace('-','_');
+    const c = document.getElementById(`chart-${id}`);
+    if (c) drawPnlChart(c, sym);
+  });
+});
+</script>
+
+<!-- Cookie consent banner (GDPR) -->
+<div id="cookie-banner" style="
+  display:none; position:fixed; bottom:0; left:0; right:0; z-index:9999;
+  background:#1c2128; border-top:1px solid var(--border);
+  padding:14px 24px; align-items:center; gap:12px; flex-wrap:wrap;
+">
+  <p style="flex:1; font-size:12px; color:var(--muted); margin:0; min-width:200px">
+    Usamos cookies estrictamente necesarias para autenticación y preferencias de idioma.
+    No usamos cookies de seguimiento ni publicidad.
+    Al continuar usando este servicio aceptas su uso.
+    <a href="https://www.cookiesandyou.com/" target="_blank" rel="noopener" style="color:var(--blue)">Más info</a>
+  </p>
+  <button onclick="acceptCookies()" style="
+    padding:7px 18px; background:var(--accent); color:#fff; border:none;
+    border-radius:5px; font-family:inherit; font-size:12px; font-weight:600;
+    cursor:pointer; white-space:nowrap;
+  ">Entendido</button>
+</div>
+<script>
+  (function() {
+    function hasCookie(name) { return document.cookie.split(';').some(c => c.trim().startsWith(name + '=')); }
+    if (!hasCookie('cookie_consent')) document.getElementById('cookie-banner').style.display = 'flex';
+  })();
+  function acceptCookies() {
+    document.cookie = 'cookie_consent=1; max-age=' + (60*60*24*365) + '; path=/; SameSite=Lax';
+    document.getElementById('cookie-banner').style.display = 'none';
+  }
+</script>
+</body>
+</html>

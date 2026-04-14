@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: tradingbotv3
+      POSTGRES_USER: tradingbot
+      POSTGRES_PASSWORD: tradingbot
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tradingbot -d tradingbotv3"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  bot:
+    build:
+      context: .
+    env_file: .env
+    environment:
+      # Override host/port so the bot connects to sibling containers, not localhost
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      EXCHANGE_NAME: bybit
+      TZ: Europe/Amsterdam
+      # Master encryption key for exchange credentials (never commit this!)
+      MASTER_ENCRYPTION_KEY: fVmsIyaMLIfS1f3tdfDvvtZhMneMCQeGeVxo1VT_foE=
+    ports:
+      - "8092:8092"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      # Persist logs outside the container
+      - ./logs:/app/logs
+      # Hot-reload static files without rebuilding
+      - ./src/api/static:/app/src/api/static
+
+# volumes removed - using bind mount instead (./pgdata on disk)

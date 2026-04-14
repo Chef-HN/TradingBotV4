@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Login — TradingBotV3{% endblock %}
+{% block content %}
+<h1>Sign In</h1>
+<form action="/auth/login" method="post">
+  <div class="field">
+    <label>Email</label>
+    <input type="email" name="email" required autofocus>
+  </div>
+  <div class="field">
+    <label>Password</label>
+    <input type="password" name="password" required>
+  </div>
+  <button class="btn" type="submit">Sign In</button>
+</form>
+<div class="links">
+  <a href="/auth/forgot-password">Forgot password?</a><br>
+  No account? <a href="/auth/register">Register</a>
+</div>
+{% endblock %}
