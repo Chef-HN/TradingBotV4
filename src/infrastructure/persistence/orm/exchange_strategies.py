@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import Boolean, DateTime, Integer, JSON, Numeric, String
+from sqlalchemy import Boolean, DateTime, Integer, JSON, Numeric, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -10,6 +10,7 @@ class ExchangeStrategyRow(Base):
     __tablename__ = "exchange_strategies"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), nullable=False, index=True)
     # Human-readable name, e.g. "bybit-tight-40bps" or "coinbase-default"
     name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     exchange_name: Mapped[str] = mapped_column(String(20), nullable=False, index=True)

@@ -10,6 +10,7 @@ class BotRestartRow(Base):
     __tablename__ = "bot_restarts"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), nullable=False, index=True)
     session_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), nullable=False)
     product_id: Mapped[str] = mapped_column(String(20), nullable=False)
     triggered_by: Mapped[str] = mapped_column(String(50), nullable=False)

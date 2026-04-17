@@ -10,6 +10,7 @@ class GridLevelRow(Base):
     __tablename__ = "grid_levels"
 
     level_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), nullable=False, index=True)
     product_id: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     session_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), nullable=False, index=True)
     side: Mapped[str] = mapped_column(String(4), nullable=False)

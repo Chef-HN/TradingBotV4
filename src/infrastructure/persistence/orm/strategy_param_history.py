@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import Boolean, DateTime, Integer, JSON, Numeric, String, Text
+from sqlalchemy import Boolean, DateTime, Integer, JSON, Numeric, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -10,6 +10,7 @@ class StrategyParamHistoryRow(Base):
     __tablename__ = "strategy_param_history"
 
     history_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), nullable=False, index=True)
     strategy_id: Mapped[int] = mapped_column(Integer, nullable=False)
     strategy_name: Mapped[str] = mapped_column(String(100), nullable=False)
     exchange_name: Mapped[str] = mapped_column(String(20), nullable=False)

@@ -11,6 +11,7 @@ class ExchangeCredentials:
     """Represents encrypted exchange credentials."""
 
     id: str
+    tenant_id: str
     exchange_name: str
     api_key: str  # Decrypted in memory only
     api_secret: str  # Decrypted in memory only

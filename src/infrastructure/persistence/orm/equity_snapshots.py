@@ -10,6 +10,7 @@ class EquitySnapshotRow(Base):
     __tablename__ = "equity_snapshots"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), nullable=False, index=True)
     session_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), nullable=False)
     product_id: Mapped[str] = mapped_column(String(20), nullable=False)
     total_equity: Mapped[float] = mapped_column(Numeric(20, 10), nullable=False)

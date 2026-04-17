@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import DateTime, String, Text
+from sqlalchemy import DateTime, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -14,6 +14,7 @@ class ExchangeCredentialsRow(Base):
     __tablename__ = "exchange_credentials"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)  # UUID as string
+    tenant_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), nullable=False, index=True)
     exchange_name: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     api_key_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     api_secret_encrypted: Mapped[str] = mapped_column(Text, nullable=False)

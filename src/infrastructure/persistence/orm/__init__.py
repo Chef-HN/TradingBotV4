@@ -5,7 +5,13 @@ from .exchange_strategies import ExchangeStrategyRow
 from .fills import FillRow
 from .grid_levels import GridLevelRow
 from .otp_codes import OtpRow
+from .parameter_change_audit import ParameterChangeAuditRow
 from .sessions import SessionRow
 from .strategy_param_history import StrategyParamHistoryRow
+from .tenant_api_keys import TenantApiKeyRow
+from .tenant_pair_strategies import TenantPairStrategyRow
+from .tenant_pair_strategy_history import TenantPairStrategyHistoryRow
+from .tenants import TenantRow
 from .ticks import TickRow
 from .users import UserRow
+from .worker_process_log import WorkerProcessLogRow

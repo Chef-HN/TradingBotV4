@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, DateTime, Index, Numeric, String
+from sqlalchemy import BigInteger, DateTime, Index, Numeric, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -10,6 +10,7 @@ class TickRow(Base):
     __tablename__ = "ticks"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), nullable=False, index=True)
     product_id: Mapped[str] = mapped_column(String(20), nullable=False)
     bid: Mapped[float] = mapped_column(Numeric(20, 10), nullable=False)
     ask: Mapped[float] = mapped_column(Numeric(20, 10), nullable=False)

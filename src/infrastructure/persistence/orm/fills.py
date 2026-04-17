@@ -10,6 +10,7 @@ class FillRow(Base):
     __tablename__ = "fills"
 
     fill_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), nullable=False, index=True)
     order_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     client_order_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     product_id: Mapped[str] = mapped_column(String(20), nullable=False, index=True)

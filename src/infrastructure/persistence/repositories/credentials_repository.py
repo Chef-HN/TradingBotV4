@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from domain.models import ExchangeCredentials
 from infrastructure.encryption import decrypt, encrypt
 from infrastructure.persistence.orm.exchange_credentials import ExchangeCredentialsRow
+from infrastructure.tenancy import DEFAULT_TENANT_ID
 
 
 class CredentialsRepository:
@@ -21,6 +22,7 @@ class CredentialsRepository:
 
     async def save_credentials(
         self,
+        tenant_id: str,
         exchange_name: str,
         api_key: str,
         api_secret: str,
@@ -47,6 +49,7 @@ class CredentialsRepository:
         # Check if credentials already exist for this exchange
         existing = await self._session.execute(
             select(ExchangeCredentialsRow).where(
+                ExchangeCredentialsRow.tenant_id == tenant_id,
                 ExchangeCredentialsRow.exchange_name == exchange_name,
                 ExchangeCredentialsRow.active == True,
             )
@@ -72,6 +75,7 @@ class CredentialsRepository:
             # Create new credentials
             row = ExchangeCredentialsRow(
                 id=credential_id,
+                tenant_id=tenant_id,
                 exchange_name=exchange_name,
                 api_key_encrypted=encrypted_key,
                 api_secret_encrypted=encrypted_secret,
@@ -86,7 +90,11 @@ class CredentialsRepository:
             await self._session.flush()
             return self._row_to_model(row)
 
-    async def get_credentials(self, exchange_name: str) -> ExchangeCredentials | None:
+    async def get_credentials(
+        self,
+        exchange_name: str,
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> ExchangeCredentials | None:
         """
         Get decrypted credentials for an exchange.
 
@@ -97,6 +105,7 @@ class CredentialsRepository:
             ExchangeCredentials with decrypted values, or None if not found
         """
         stmt = select(ExchangeCredentialsRow).where(
+            ExchangeCredentialsRow.tenant_id == tenant_id,
             ExchangeCredentialsRow.exchange_name == exchange_name,
             ExchangeCredentialsRow.active == True,
         )
@@ -108,16 +117,24 @@ class CredentialsRepository:
 
         return self._row_to_model(row)
 
-    async def get_all_credentials(self) -> list[ExchangeCredentials]:
+    async def get_all_credentials(self, tenant_id: str = DEFAULT_TENANT_ID) -> list[ExchangeCredentials]:
         """Get all active credentials (all exchanges)."""
-        stmt = select(ExchangeCredentialsRow).where(ExchangeCredentialsRow.active == True)
+        stmt = select(ExchangeCredentialsRow).where(
+            ExchangeCredentialsRow.tenant_id == tenant_id,
+            ExchangeCredentialsRow.active == True,
+        )
         result = await self._session.execute(stmt)
         rows = result.scalars().all()
         return [self._row_to_model(r) for r in rows]
 
-    async def deactivate_credentials(self, exchange_name: str) -> None:
+    async def deactivate_credentials(
+        self,
+        exchange_name: str,
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> None:
         """Soft-delete: mark credentials as inactive."""
         stmt = select(ExchangeCredentialsRow).where(
+            ExchangeCredentialsRow.tenant_id == tenant_id,
             ExchangeCredentialsRow.exchange_name == exchange_name
         )
         result = await self._session.execute(stmt)
@@ -132,6 +149,7 @@ class CredentialsRepository:
         """Convert DB row to domain model (with decryption)."""
         return ExchangeCredentials(
             id=row.id,
+            tenant_id=row.tenant_id,
             exchange_name=row.exchange_name,
             api_key=decrypt(row.api_key_encrypted),
             api_secret=decrypt(row.api_secret_encrypted),

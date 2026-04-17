@@ -1,1 +1,3 @@
 from .grid_repository import GridRepository
+from .tenant_pair_strategy_repository import TenantPairStrategyRepository
+from .tenant_repository import TenantRepository

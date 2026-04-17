@@ -10,6 +10,7 @@ class SessionRow(Base):
     __tablename__ = "sessions"
 
     session_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), nullable=False, index=True)
     product_id: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     mode: Mapped[str] = mapped_column(String(10), nullable=False)  # paper | live
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
