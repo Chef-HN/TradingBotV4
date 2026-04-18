@@ -17,6 +17,7 @@ class AppSettings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8090
     api_key: str = ""
+    default_tenant_id: str = "00000000-0000-0000-0000-000000000001"
     run_api: bool = True
     run_worker: bool = True
 

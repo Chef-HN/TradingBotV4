@@ -270,7 +270,10 @@ async def _load_credentials_from_db(exchange_name: str) -> dict[str, str] | None
     try:
         async with AsyncSessionFactory() as db:
             repo = CredentialsRepository(db)
-            creds = await repo.get_credentials(exchange_name.lower())
+            creds = await repo.get_credentials(
+                exchange_name.lower(),
+                tenant_id=settings.app.default_tenant_id,
+            )
 
         if creds is None:
             _emit(f"No credentials found in DB for exchange: {exchange_name}")
@@ -1568,7 +1571,11 @@ async def _run_worker(runtime: RuntimeContext, state_store: StateStore) -> None:
 async def main() -> None:
     exchange_name = settings.exchange.name.lower()
 
-    state_store = StateStore(settings.redis.url, exchange=exchange_name)
+    state_store = StateStore(
+        settings.redis.url,
+        exchange=exchange_name,
+        tenant_id=settings.app.default_tenant_id,
+    )
 
     # Restore session started_at from Redis (for PnL context continuity across restarts)
     restored_started_at = await state_store.get_started_at()

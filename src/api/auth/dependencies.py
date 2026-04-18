@@ -93,7 +93,7 @@ async def require_api_auth(request: Request) -> ApiPrincipal:
 
     user = await get_current_user(request)
     if user is None:
-        raise AuthRequired()
+        raise HTTPException(status_code=401, detail="Authentication required")
     tenant_id = getattr(user, "tenant_id", DEFAULT_TENANT_ID) or DEFAULT_TENANT_ID
     principal = ApiPrincipal(
         tenant_id=tenant_id,

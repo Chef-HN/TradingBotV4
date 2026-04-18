@@ -8,12 +8,14 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from auth_kit.auth.dependencies import AuthRequired
-from api.auth.dependencies import auth_exception_handler, require_auth
+from api.auth.dependencies import auth_exception_handler, require_api_auth, require_auth
 from api.i18n.middleware import LocaleMiddleware
 from .routes.auth_routes import router as auth_router
 from .routes.credentials import router as credentials_router
 from .routes.dashboard import router as dashboard_router
 from .routes.health import router as health_router
+from .routes.saas import router as saas_router
+from .routes.saas_auth import router as saas_auth_router
 
 _STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -35,17 +37,24 @@ app.add_exception_handler(AuthRequired, auth_exception_handler)
 
 app.include_router(health_router, tags=["health"])
 app.include_router(auth_router, tags=["auth"])
+app.include_router(saas_auth_router, tags=["saas-auth"])
 app.include_router(
     credentials_router,
     prefix="/api",
     tags=["credentials"],
-    dependencies=[Depends(require_auth)],
+    dependencies=[Depends(require_api_auth)],
 )
 app.include_router(
     dashboard_router,
     prefix="/api",
     tags=["dashboard"],
-    dependencies=[Depends(require_auth)],
+    dependencies=[Depends(require_api_auth)],
+)
+app.include_router(
+    saas_router,
+    prefix="/api",
+    tags=["saas"],
+    dependencies=[Depends(require_api_auth)],
 )
 
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")

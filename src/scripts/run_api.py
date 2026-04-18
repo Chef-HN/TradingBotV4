@@ -13,6 +13,7 @@ import uvicorn
 
 from api.app import app
 from api.routes import dashboard as dashboard_module
+from api.routes import saas as saas_module
 from config import get_settings
 from infrastructure.state_store import StateStore
 
@@ -20,8 +21,13 @@ settings = get_settings()
 
 
 async def main() -> None:
-    store = StateStore(settings.redis.url, exchange=settings.exchange.name.lower())
+    store = StateStore(
+        settings.redis.url,
+        exchange=settings.exchange.name.lower(),
+        tenant_id=settings.app.default_tenant_id,
+    )
     dashboard_module.set_state_store(store)
+    saas_module.set_state_store(store)
     config = uvicorn.Config(
         app,
         host=settings.app.host,

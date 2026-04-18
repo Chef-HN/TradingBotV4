@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from api.auth.dependencies import ApiPrincipal, require_api_auth
 from infrastructure.persistence.database import AsyncSessionFactory
 from infrastructure.persistence.repositories.credentials_repository import CredentialsRepository
 
@@ -33,7 +34,10 @@ class CredentialsResponse(BaseModel):
 
 
 @router.post("/credentials")
-async def save_credentials(body: SaveCredentialsRequest) -> dict:
+async def save_credentials(
+    body: SaveCredentialsRequest,
+    principal: ApiPrincipal = Depends(require_api_auth),
+) -> dict:
     """
     Save or update encrypted exchange credentials.
 
@@ -54,6 +58,7 @@ async def save_credentials(body: SaveCredentialsRequest) -> dict:
         async with AsyncSessionFactory() as db:
             repo = CredentialsRepository(db)
             creds = await repo.save_credentials(
+                tenant_id=principal.tenant_id,
                 exchange_name=exchange_name,
                 api_key=body.api_key,
                 api_secret=body.api_secret,
@@ -77,7 +82,10 @@ async def save_credentials(body: SaveCredentialsRequest) -> dict:
 
 
 @router.get("/credentials/{exchange_name}")
-async def get_credentials_status(exchange_name: str) -> dict:
+async def get_credentials_status(
+    exchange_name: str,
+    principal: ApiPrincipal = Depends(require_api_auth),
+) -> dict:
     """
     Check if credentials exist for an exchange (returns status only, no plaintext secrets).
 
@@ -91,7 +99,7 @@ async def get_credentials_status(exchange_name: str) -> dict:
     try:
         async with AsyncSessionFactory() as db:
             repo = CredentialsRepository(db)
-            creds = await repo.get_credentials(exchange_name)
+            creds = await repo.get_credentials(exchange_name, tenant_id=principal.tenant_id)
 
         if creds is None:
             return {
@@ -114,7 +122,10 @@ async def get_credentials_status(exchange_name: str) -> dict:
 
 
 @router.delete("/credentials/{exchange_name}")
-async def deactivate_credentials(exchange_name: str) -> dict:
+async def deactivate_credentials(
+    exchange_name: str,
+    principal: ApiPrincipal = Depends(require_api_auth),
+) -> dict:
     """
     Deactivate credentials for an exchange (soft delete).
 
@@ -126,7 +137,7 @@ async def deactivate_credentials(exchange_name: str) -> dict:
     try:
         async with AsyncSessionFactory() as db:
             repo = CredentialsRepository(db)
-            await repo.deactivate_credentials(exchange_name)
+            await repo.deactivate_credentials(exchange_name, tenant_id=principal.tenant_id)
             await db.commit()
 
         return {
