@@ -15,6 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -39,6 +40,9 @@ from infrastructure.persistence.database import AsyncSessionFactory
 from infrastructure.persistence.repositories.credentials_repository import CredentialsRepository
 from infrastructure.persistence.repositories.exchange_strategy_repository import ExchangeStrategyRepository
 from infrastructure.persistence.repositories.grid_repository import GridRepository
+from infrastructure.persistence.repositories.tenant_pair_strategy_repository import (
+    TenantPairStrategyRepository,
+)
 from infrastructure.state_store import StateStore
 from risk.engine import RiskEngine
 from strategy.neutral_grid import NeutralGridEngine
@@ -244,6 +248,111 @@ def _resolve_symbol_settings(base: Any, overrides: dict | None, symbol: str) -> 
             f"Per-symbol strategy for '{symbol}' produced no settings update."
         )
     return base.model_copy(update=update)
+
+
+_PAIR_GLOBAL_UNIFORM_FIELDS = (
+    "paper_mode",
+    "total_wallet_usd",
+    "maker_fee_rate",
+    "local_timezone_iana",
+    "daily_close_hour",
+    "daily_close_minute",
+    "spread_freeze_bps",
+    "regime_stress_spread_bps",
+    "regime_trend_slope_threshold",
+    "regime_mr_distance_threshold_bps",
+    "regime_hysteresis_bps",
+    "regime_rsi_bear_threshold",
+    "regime_rsi_bull_threshold",
+    "ws_retry_window_seconds",
+    "ws_initial_retry_delay_seconds",
+    "ws_max_retry_delay_seconds",
+    "ws_message_timeout_seconds",
+    "ws_heartbeat_timeout_seconds",
+)
+
+
+def _build_pair_strategy_synthetic_row(
+    *,
+    exchange_name: str,
+    tenant_id: str,
+    pair_rows: list[Any],
+) -> Any:
+    """
+    Convert tenant_pair_strategies rows to a synthetic strategy object compatible
+    with existing worker code path.
+    """
+    if not pair_rows:
+        return None
+
+    first = pair_rows[0]
+    for field in _PAIR_GLOBAL_UNIFORM_FIELDS:
+        values = {str(getattr(r, field)) for r in pair_rows}
+        if len(values) > 1:
+            raise RuntimeError(
+                "Worker fail-fast: tenant_pair_strategies for "
+                f"tenant={tenant_id} exchange={exchange_name} must share '{field}'. "
+                f"Found values: {sorted(values)}"
+            )
+
+    sorted_rows = sorted(pair_rows, key=lambda r: str(r.product_id))
+    symbols = [str(r.product_id).upper() for r in sorted_rows]
+    symbol_overrides: dict[str, dict[str, Any]] = {}
+    for row in sorted_rows:
+        symbol = str(row.product_id).upper()
+        symbol_overrides[symbol] = {
+            "spacing_bps": float(row.spacing_bps),
+            "rebalance_threshold_bps": float(row.rebalance_threshold_bps),
+            "grid_levels": int(row.grid_levels),
+            "level_size_quote": float(row.level_size_quote),
+            "stale_reprice_threshold_bps": float(row.stale_reprice_threshold_bps),
+            "stale_order_age_seconds": int(row.stale_order_age_seconds),
+            "rebalance_defer_seconds": int(row.rebalance_defer_seconds),
+            "rebalance_defer_max_drift_bps": float(row.rebalance_defer_max_drift_bps),
+            "max_inventory_ratio": float(row.max_inventory_ratio),
+            "session_capital_usd": float(row.session_capital_usd),
+            "maker_only": bool(row.maker_only),
+        }
+
+    return SimpleNamespace(
+        id=None,
+        tenant_id=tenant_id,
+        name=f"tenant-{tenant_id}-{exchange_name}-pair-strategy",
+        exchange_name=exchange_name,
+        is_active=True,
+        symbols=",".join(symbols),
+        spacing_bps=first.spacing_bps,
+        rebalance_threshold_bps=first.rebalance_threshold_bps,
+        grid_levels=first.grid_levels,
+        level_size_quote=first.level_size_quote,
+        max_inventory_ratio=first.max_inventory_ratio,
+        maker_fee_rate=first.maker_fee_rate,
+        stale_reprice_threshold_bps=first.stale_reprice_threshold_bps,
+        stale_order_age_seconds=first.stale_order_age_seconds,
+        rebalance_defer_seconds=first.rebalance_defer_seconds,
+        rebalance_defer_max_drift_bps=first.rebalance_defer_max_drift_bps,
+        paper_mode=first.paper_mode,
+        total_wallet_usd=first.total_wallet_usd,
+        session_capital_usd=first.session_capital_usd,
+        maker_only=first.maker_only,
+        local_timezone_iana=first.local_timezone_iana,
+        daily_close_hour=first.daily_close_hour,
+        daily_close_minute=first.daily_close_minute,
+        spread_freeze_bps=first.spread_freeze_bps,
+        regime_stress_spread_bps=first.regime_stress_spread_bps,
+        regime_trend_slope_threshold=first.regime_trend_slope_threshold,
+        regime_mr_distance_threshold_bps=first.regime_mr_distance_threshold_bps,
+        regime_hysteresis_bps=first.regime_hysteresis_bps,
+        regime_rsi_bear_threshold=first.regime_rsi_bear_threshold,
+        regime_rsi_bull_threshold=first.regime_rsi_bull_threshold,
+        ws_retry_window_seconds=first.ws_retry_window_seconds,
+        ws_initial_retry_delay_seconds=first.ws_initial_retry_delay_seconds,
+        ws_max_retry_delay_seconds=first.ws_max_retry_delay_seconds,
+        ws_message_timeout_seconds=first.ws_message_timeout_seconds,
+        ws_heartbeat_timeout_seconds=first.ws_heartbeat_timeout_seconds,
+        symbol_overrides=symbol_overrides,
+        updated_by=getattr(first, "updated_by", "system"),
+    )
 
 
 def _build_order_payload(intent: OrderIntent) -> dict:
@@ -1189,14 +1298,34 @@ async def _run_worker(runtime: RuntimeContext, state_store: StateStore) -> None:
     exchange_name = settings.exchange.name.lower()  # "coinbase" | "bybit"
     _emit(f"Exchange: {exchange_name}")
 
-    # Load active strategy from DB for this exchange (overrides .env values)
+    # Load strategy from tenant_pair_strategies first (V4 source of truth),
+    # fallback to legacy exchange_strategies only when pair table is empty.
     st = settings.strategy
+    tenant_id = settings.app.default_tenant_id
     async with AsyncSessionFactory() as db:
-        strat_repo = ExchangeStrategyRepository(db)
-        db_strat = await strat_repo.get_active(exchange_name)
+        pair_repo = TenantPairStrategyRepository(db)
+        pair_rows = await pair_repo.list_active_for_exchange(tenant_id, exchange_name)
+        if pair_rows:
+            db_strat = _build_pair_strategy_synthetic_row(
+                exchange_name=exchange_name,
+                tenant_id=tenant_id,
+                pair_rows=pair_rows,
+            )
+            _emit(
+                "Strategy loaded from tenant_pair_strategies: "
+                f"tenant={tenant_id} exchange={exchange_name} pairs={len(pair_rows)}"
+            )
+        else:
+            strat_repo = ExchangeStrategyRepository(db)
+            db_strat = await strat_repo.get_active(exchange_name)
+            if db_strat is not None:
+                _emit(
+                    "WARNING: tenant_pair_strategies empty. "
+                    f"Using legacy exchange_strategies fallback '{db_strat.name}'."
+                )
     if db_strat is None:
         raise RuntimeError(
-            f"No active DB strategy for '{exchange_name}'. "
+            f"No active DB strategy for '{exchange_name}' tenant='{tenant_id}'. "
             "Worker fail-fast: all runtime params must be loaded from DB."
         )
 
