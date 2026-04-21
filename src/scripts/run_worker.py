@@ -38,7 +38,6 @@ from infrastructure.encryption import get_encryption_manager
 from infrastructure.paper import PaperTradingAdapter
 from infrastructure.persistence.database import AsyncSessionFactory
 from infrastructure.persistence.repositories.credentials_repository import CredentialsRepository
-from infrastructure.persistence.repositories.exchange_strategy_repository import ExchangeStrategyRepository
 from infrastructure.persistence.repositories.grid_repository import GridRepository
 from infrastructure.persistence.repositories.tenant_pair_strategy_repository import (
     TenantPairStrategyRepository,
@@ -1298,10 +1297,11 @@ async def _run_worker(runtime: RuntimeContext, state_store: StateStore) -> None:
     exchange_name = settings.exchange.name.lower()  # "coinbase" | "bybit"
     _emit(f"Exchange: {exchange_name}")
 
-    # Load strategy from tenant_pair_strategies first (V4 source of truth),
-    # fallback to legacy exchange_strategies only when pair table is empty.
+    # V4 runtime source of truth: tenant_pair_strategies (pair-scoped only).
+    # Global legacy strategy fallback is intentionally disabled.
     st = settings.strategy
     tenant_id = settings.app.default_tenant_id
+    db_strat = None
     async with AsyncSessionFactory() as db:
         pair_repo = TenantPairStrategyRepository(db)
         pair_rows = await pair_repo.list_active_for_exchange(tenant_id, exchange_name)
@@ -1315,18 +1315,10 @@ async def _run_worker(runtime: RuntimeContext, state_store: StateStore) -> None:
                 "Strategy loaded from tenant_pair_strategies: "
                 f"tenant={tenant_id} exchange={exchange_name} pairs={len(pair_rows)}"
             )
-        else:
-            strat_repo = ExchangeStrategyRepository(db)
-            db_strat = await strat_repo.get_active(exchange_name)
-            if db_strat is not None:
-                _emit(
-                    "WARNING: tenant_pair_strategies empty. "
-                    f"Using legacy exchange_strategies fallback '{db_strat.name}'."
-                )
     if db_strat is None:
         raise RuntimeError(
-            f"No active DB strategy for '{exchange_name}' tenant='{tenant_id}'. "
-            "Worker fail-fast: all runtime params must be loaded from DB."
+            f"No active pair strategy rows for exchange='{exchange_name}' tenant='{tenant_id}'. "
+            "Worker fail-fast: V4 runtime only accepts tenant_pair_strategies."
         )
 
     required_runtime_fields = (
