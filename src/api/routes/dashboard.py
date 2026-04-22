@@ -132,27 +132,6 @@ async def get_status(exchange: str | None = Query(default=None)) -> BotStatus:
     return BotStatus.model_validate({**data, "worker_alive": alive})
 
 
-class ResetRequest(BaseModel):
-    triggered_by: str = "Abraham"
-    exchange: str = ""
-    reset_type: str = "daily_close"  # "daily_close" = reconcile, "hard" = back to defaults
-
-
-@router.post("/reset")
-async def reset_bot(body: ResetRequest = ResetRequest()) -> dict:
-    store = _get_store()
-    cmd = {"type": "reset", "triggered_by": body.triggered_by, "reset_type": body.reset_type}
-    targets = await _resolve_target_exchanges(store, body.exchange or None)
-    for exchange in targets:
-        await store.push_command_to_exchange(exchange, cmd)
-    return {
-        "status": "reset_scheduled",
-        "triggered_by": body.triggered_by,
-        "reset_type": body.reset_type,
-        "targets": targets,
-    }
-
-
 class SkipCloseRequest(BaseModel):
     exchange: str = ""
 
