@@ -13,6 +13,12 @@ from typing import Any
 
 import redis.asyncio as aioredis
 
+from application.contracts.worker_protocol import (
+    RuntimeCommand,
+    build_command_envelope,
+    build_state_payload,
+    parse_runtime_command,
+)
 from infrastructure.tenancy import DEFAULT_TENANT_ID
 
 STATE_TTL_SECONDS = 30
@@ -102,7 +108,15 @@ class StateStore:
         return _started_at_key(tenant_id=self._tenant_id, exchange=self._exchange)
 
     async def publish_state(self, state_dict: dict) -> None:
-        payload = json.dumps(state_dict, cls=_BotEncoder)
+        payload = json.dumps(
+            build_state_payload(
+                tenant_id=self._tenant_id,
+                exchange=self._exchange,
+                product_id=self._product_id,
+                state=state_dict,
+            ),
+            cls=_BotEncoder,
+        )
         await self._redis.set(self._key_state, payload, ex=STATE_TTL_SECONDS)
 
     async def publish_heartbeat(self) -> None:
@@ -157,7 +171,13 @@ class StateStore:
         return json.loads(raw)
 
     async def push_command(self, cmd: dict) -> None:
-        payload = json.dumps(cmd, cls=_BotEncoder)
+        command = self._build_command_payload(
+            cmd,
+            exchange=self._exchange,
+            tenant_id=self._tenant_id,
+            product_id=cmd.get("product_id", "all") if isinstance(cmd, dict) else "all",
+        )
+        payload = json.dumps(command, cls=_BotEncoder)
         await self._redis.lpush(self._key_commands, payload)
 
     async def push_command_to_exchange(
@@ -172,10 +192,14 @@ class StateStore:
             await self.push_command(cmd)
             return
         tid = _part(tenant_id, self._tenant_id)
-        target = dict(cmd)
-        if product_id:
-            target.setdefault("product_id", product_id.upper())
-        payload = json.dumps(target, cls=_BotEncoder)
+        target_pid = _part(product_id, "all")
+        command = self._build_command_payload(
+            cmd,
+            exchange=ex,
+            tenant_id=tid,
+            product_id=target_pid,
+        )
+        payload = json.dumps(command, cls=_BotEncoder)
         key = _commands_key(tenant_id=tid, exchange=ex, product_id="all")
         await self._redis.lpush(key, payload)
 
@@ -190,6 +214,25 @@ class StateStore:
             except json.JSONDecodeError:
                 continue
         return commands
+
+    async def pop_runtime_commands(
+        self,
+        *,
+        default_tenant_id: str | None = None,
+        default_exchange: str | None = None,
+        default_product_id: str = "all",
+    ) -> list[RuntimeCommand]:
+        parsed: list[RuntimeCommand] = []
+        for raw in await self.pop_commands():
+            command = parse_runtime_command(
+                raw,
+                default_tenant_id=_part(default_tenant_id, self._tenant_id),
+                default_exchange=_part(default_exchange, self._exchange),
+                default_product_id=default_product_id,
+            )
+            if command is not None:
+                parsed.append(command)
+        return parsed
 
     async def get_skip_daily_close(self) -> bool:
         return await self._redis.exists(self._key_skip_close) > 0
@@ -222,3 +265,67 @@ class StateStore:
 
     async def close(self) -> None:
         await self._redis.aclose()
+
+    @staticmethod
+    def _extract_payload(cmd: dict[str, Any]) -> dict[str, Any]:
+        payload = cmd.get("payload")
+        if isinstance(payload, dict):
+            return dict(payload)
+        return {
+            key: value
+            for key, value in cmd.items()
+            if key
+            not in {
+                "protocol_version",
+                "kind",
+                "command_id",
+                "command_type",
+                "type",
+                "tenant_id",
+                "exchange",
+                "product_id",
+                "requested_at",
+                "actor",
+                "reason",
+                "payload",
+            }
+        }
+
+    def _build_command_payload(
+        self,
+        cmd: dict[str, Any],
+        *,
+        exchange: str,
+        tenant_id: str,
+        product_id: str,
+    ) -> dict[str, Any]:
+        if not isinstance(cmd, dict):
+            raise ValueError("Command payload must be a dict")
+        command_type = str(cmd.get("command_type") or cmd.get("type") or "").strip().lower()
+        if not command_type:
+            raise ValueError("Command is missing required field 'type'")
+        payload = self._extract_payload(cmd)
+        actor = cmd.get("actor")
+        if actor is None:
+            actor = cmd.get("triggered_by")
+        actor_str = str(actor).strip() if isinstance(actor, str) and actor.strip() else None
+        reason = str(cmd.get("reason")).strip() if isinstance(cmd.get("reason"), str) and str(cmd.get("reason")).strip() else None
+        command_id = str(cmd.get("command_id")).strip() if isinstance(cmd.get("command_id"), str) else None
+        requested_at = None
+        if isinstance(cmd.get("requested_at"), str):
+            try:
+                requested_at = datetime.fromisoformat(cmd["requested_at"])
+            except ValueError:
+                requested_at = None
+        envelope = build_command_envelope(
+            command_type=command_type,
+            tenant_id=tenant_id,
+            exchange=exchange,
+            product_id=product_id,
+            payload=payload,
+            actor=actor_str,
+            reason=reason,
+            command_id=command_id,
+            requested_at=requested_at,
+        )
+        return envelope

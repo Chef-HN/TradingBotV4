@@ -20,6 +20,13 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from application.contracts.worker_protocol import (
+    COMMAND_RESET,
+    COMMAND_SKIP_DAILY_CLOSE,
+    COMMAND_UPDATE_DAILY_CLOSE_SCHEDULE,
+    RuntimeCommand,
+    parse_runtime_command,
+)
 from application.services.event_bus import InMemoryEventBus
 from application.services.market_data_engine import MarketDataEngine
 from application.services.trading_kernel import TradingKernel
@@ -1229,39 +1236,98 @@ async def _daily_close_loop(runtime: RuntimeContext, state_store: StateStore) ->
 async def _process_runtime_commands(runtime: RuntimeContext, state_store: StateStore) -> None:
     """Drain command queue once per worker process loop (not per symbol)."""
     try:
-        commands = await state_store.pop_commands()
+        if hasattr(state_store, "pop_runtime_commands"):
+            commands = await state_store.pop_runtime_commands(
+                default_tenant_id=settings.app.default_tenant_id,
+                default_exchange=settings.exchange.name.lower(),
+                default_product_id="all",
+            )
+        else:
+            raw_commands = await state_store.pop_commands()
+            commands = []
+            for raw in raw_commands:
+                parsed = parse_runtime_command(
+                    raw,
+                    default_tenant_id=settings.app.default_tenant_id,
+                    default_exchange=settings.exchange.name.lower(),
+                    default_product_id="all",
+                )
+                if parsed is None:
+                    _emit(f"Ignoring invalid runtime command payload: {raw}")
+                    continue
+                commands.append(parsed)
     except Exception as exc:
         _emit(f"Command drain error: {exc}")
         return
 
+    runtime_tenant = settings.app.default_tenant_id.strip().lower()
+    runtime_exchange = settings.exchange.name.lower().strip()
+
     for cmd in commands:
-        cmd_type = cmd.get("type")
-        if cmd_type == "reset":
-            triggered_by = cmd.get("triggered_by", "Abraham")
-            reset_type = cmd.get("reset_type", "daily_close")
-            _emit(f"Redis command: reset (triggered_by={triggered_by}, type={reset_type})")
-            for ctx in runtime.symbol_contexts.values():
+        if not isinstance(cmd, RuntimeCommand):
+            continue
+        if cmd.tenant_id != runtime_tenant:
+            _emit(
+                f"Ignoring command {cmd.command_id}: tenant mismatch "
+                f"{cmd.tenant_id} != {runtime_tenant}"
+            )
+            continue
+        if cmd.exchange and cmd.exchange != runtime_exchange:
+            _emit(
+                f"Ignoring command {cmd.command_id}: exchange mismatch "
+                f"{cmd.exchange} != {runtime_exchange}"
+            )
+            continue
+
+        target_product = cmd.product_id
+        if target_product != "all" and target_product not in runtime.symbol_contexts:
+            _emit(
+                f"Ignoring command {cmd.command_id}: unknown product_id '{target_product}'"
+            )
+            continue
+
+        target_contexts: list[SymbolContext]
+        if target_product == "all":
+            target_contexts = list(runtime.symbol_contexts.values())
+        else:
+            target_contexts = [runtime.symbol_contexts[target_product]]
+
+        payload = cmd.payload
+        cmd_type = cmd.command_type
+        if cmd_type == COMMAND_RESET:
+            triggered_by = cmd.actor or str(payload.get("triggered_by", "Abraham"))
+            reset_type = str(payload.get("reset_type", "daily_close"))
+            _emit(
+                "Redis command: reset "
+                f"(id={cmd.command_id}, product={target_product}, triggered_by={triggered_by}, type={reset_type})"
+            )
+            for ctx in target_contexts:
                 ctx.reset_triggered_by = triggered_by
                 ctx.reset_type = reset_type
                 ctx.reset_requested = True
-        elif cmd_type == "skip_daily_close":
-            _emit("Redis command: skip_daily_close")
+        elif cmd_type == COMMAND_SKIP_DAILY_CLOSE:
+            _emit(
+                f"Redis command: skip_daily_close (id={cmd.command_id}, product={target_product})"
+            )
             runtime.skip_daily_close = True
             asyncio.create_task(_persist(state_store.set_skip_daily_close(True)))
-        elif cmd_type == "update_daily_close_schedule":
-            tz_name = str(cmd.get("local_timezone_iana", runtime.local_timezone_iana))
-            close_hour = int(cmd.get("daily_close_hour", runtime.daily_close_hour))
-            close_minute = int(cmd.get("daily_close_minute", runtime.daily_close_minute))
-            mode = str(cmd.get("mode", "next_cycle")).strip().lower()
+        elif cmd_type == COMMAND_UPDATE_DAILY_CLOSE_SCHEDULE:
+            tz_name = str(payload.get("local_timezone_iana", runtime.local_timezone_iana))
+            close_hour = int(payload.get("daily_close_hour", runtime.daily_close_hour))
+            close_minute = int(payload.get("daily_close_minute", runtime.daily_close_minute))
+            mode = str(payload.get("mode", "next_cycle")).strip().lower()
             try:
                 ZoneInfo(tz_name)
             except ZoneInfoNotFoundError:
-                _emit(f"Ignoring schedule update with invalid timezone: {tz_name}")
+                _emit(
+                    "Ignoring schedule update with invalid timezone "
+                    f"(id={cmd.command_id}, tz={tz_name})"
+                )
                 continue
             if close_hour < 0 or close_hour > 23 or close_minute < 0 or close_minute > 59:
                 _emit(
                     "Ignoring schedule update with invalid local close time: "
-                    f"{close_hour:02d}:{close_minute:02d}"
+                    f"{close_hour:02d}:{close_minute:02d} (id={cmd.command_id})"
                 )
                 continue
 
@@ -1277,7 +1343,8 @@ async def _process_runtime_commands(runtime: RuntimeContext, state_store: StateS
                 runtime.next_daily_close_at = None
                 _emit(
                     "Redis command: update_daily_close_schedule applied immediately -> "
-                    f"{tz_name} {close_hour:02d}:{close_minute:02d}"
+                    f"{tz_name} {close_hour:02d}:{close_minute:02d} "
+                    f"(id={cmd.command_id}, product={target_product})"
                 )
             else:
                 runtime.pending_schedule_after_close = {
@@ -1287,10 +1354,11 @@ async def _process_runtime_commands(runtime: RuntimeContext, state_store: StateS
                 }
                 _emit(
                     "Redis command: update_daily_close_schedule queued for next cycle -> "
-                    f"{tz_name} {close_hour:02d}:{close_minute:02d}"
+                    f"{tz_name} {close_hour:02d}:{close_minute:02d} "
+                    f"(id={cmd.command_id}, product={target_product})"
                 )
         else:
-            _emit(f"Unknown Redis command type: {cmd_type}")
+            _emit(f"Unknown Redis command type '{cmd_type}' (id={cmd.command_id})")
 
 
 async def _run_worker(runtime: RuntimeContext, state_store: StateStore) -> None:
