@@ -1167,6 +1167,21 @@ async def _heartbeat_loop(state_store: StateStore) -> None:
         await asyncio.sleep(5)
 
 
+async def _command_loop(runtime: RuntimeContext, state_store: StateStore) -> None:
+    """
+    Single command consumer per worker process.
+
+    Keeping a single consumer avoids race conditions between independent loops
+    trying to drain the same Redis command queue concurrently.
+    """
+    while not runtime.config_loaded or not runtime.symbol_contexts:
+        await asyncio.sleep(0.2)
+
+    while True:
+        await _process_runtime_commands(runtime, state_store)
+        await asyncio.sleep(0.25)
+
+
 async def _daily_close_loop(runtime: RuntimeContext, state_store: StateStore) -> None:
     """
     Reset all symbol sessions at local midnight every day.
@@ -1179,8 +1194,6 @@ async def _daily_close_loop(runtime: RuntimeContext, state_store: StateStore) ->
         await asyncio.sleep(1)
 
     while True:
-        await _process_runtime_commands(runtime, state_store)
-
         if runtime.next_daily_close_at is None or runtime.schedule_resync_requested:
             runtime.schedule_resync_requested = False
             now_utc = datetime.now(UTC)
@@ -1726,7 +1739,6 @@ async def _run_worker(runtime: RuntimeContext, state_store: StateStore) -> None:
         except StopAsyncIteration:
             _emit("WebSocket stream ended â€” exiting for supervisor restart")
             break
-        await _process_runtime_commands(runtime, state_store)
         await market_data_engine.process_ws_message(raw_message)
         if symbols and all(
             market_data_engine.has_seen_heartbeat(sym)
@@ -1826,6 +1838,7 @@ async def main() -> None:
         signal.signal(signal.SIGINT, lambda *_: stop_event.set())
 
     tasks: list[asyncio.Task] = [
+        asyncio.create_task(_command_loop(runtime, state_store), name="commands"),
         asyncio.create_task(_run_worker(runtime, state_store), name="worker"),
         asyncio.create_task(_daily_close_loop(runtime, state_store), name="daily_close"),
         asyncio.create_task(_heartbeat_loop(state_store), name="heartbeat"),
