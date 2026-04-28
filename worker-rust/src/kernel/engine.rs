@@ -4,8 +4,8 @@ use serde_json::json;
 use thiserror::Error;
 
 use super::types::{
-    DailyCloseInput, DailyCloseOutcome, FillEvent, KernelDecision, MarketTick, OrderRequest, StrategyConfig,
-    WorkerStateEvent,
+    DailyCloseInput, DailyCloseOutcome, FillEvent, KernelDecision, MarketTick, OrderRequest,
+    StrategyConfig, WorkerStateEvent,
 };
 
 #[derive(Debug, Error)]
@@ -114,7 +114,11 @@ impl TradingKernel {
         }
     }
 
-    pub fn on_daily_close(&mut self, input: &DailyCloseInput, emitted_at_ts_ms: i64) -> (DailyCloseOutcome, KernelOutput) {
+    pub fn on_daily_close(
+        &mut self,
+        input: &DailyCloseInput,
+        emitted_at_ts_ms: i64,
+    ) -> (DailyCloseOutcome, KernelOutput) {
         let target = input.session_capital_usd.max(0.0);
         let mut reserve = input.reserve_usd.max(0.0);
 
@@ -230,6 +234,14 @@ impl TradingKernel {
         self.active_order_ids.remove(order_id);
     }
 
+    pub fn active_order_count(&self) -> usize {
+        self.active_order_ids.len()
+    }
+
+    pub fn reference_mid(&self) -> Option<f64> {
+        self.last_reference_mid
+    }
+
     fn cancel_active_order_decisions(&self) -> Vec<KernelDecision> {
         self.active_order_ids
             .iter()
@@ -275,10 +287,14 @@ impl TradingKernel {
 
 fn validate_config(config: &StrategyConfig) -> Result<(), KernelError> {
     if config.grid_levels <= 0 {
-        return Err(KernelError::InvalidConfig("grid_levels must be > 0".to_string()));
+        return Err(KernelError::InvalidConfig(
+            "grid_levels must be > 0".to_string(),
+        ));
     }
     if config.spacing_bps <= 0.0 {
-        return Err(KernelError::InvalidConfig("spacing_bps must be > 0".to_string()));
+        return Err(KernelError::InvalidConfig(
+            "spacing_bps must be > 0".to_string(),
+        ));
     }
     if config.rebalance_threshold_bps <= 0.0 {
         return Err(KernelError::InvalidConfig(
@@ -286,7 +302,9 @@ fn validate_config(config: &StrategyConfig) -> Result<(), KernelError> {
         ));
     }
     if config.level_size_quote <= 0.0 {
-        return Err(KernelError::InvalidConfig("level_size_quote must be > 0".to_string()));
+        return Err(KernelError::InvalidConfig(
+            "level_size_quote must be > 0".to_string(),
+        ));
     }
     if config.daily_close_hour > 23 {
         return Err(KernelError::InvalidConfig(
@@ -301,7 +319,12 @@ fn validate_config(config: &StrategyConfig) -> Result<(), KernelError> {
     Ok(())
 }
 
-fn build_event(config: &StrategyConfig, state_type: &str, payload: serde_json::Value, emitted_at_ts_ms: i64) -> WorkerStateEvent {
+fn build_event(
+    config: &StrategyConfig,
+    state_type: &str,
+    payload: serde_json::Value,
+    emitted_at_ts_ms: i64,
+) -> WorkerStateEvent {
     WorkerStateEvent {
         tenant_id: config.tenant_id.clone(),
         exchange: config.exchange.clone(),
@@ -318,4 +341,3 @@ fn quote_to_base(level_size_quote: f64, price: f64) -> f64 {
     }
     level_size_quote / price
 }
-

@@ -43,7 +43,13 @@ impl ExecutionProvider for BybitSimulatorExecutionProvider {
         Ok(order_id)
     }
 
-    async fn cancel(&mut self, _tenant_id: &str, _exchange: &str, _product_id: &str, order_id: &str) -> Result<()> {
+    async fn cancel(
+        &mut self,
+        _tenant_id: &str,
+        _exchange: &str,
+        _product_id: &str,
+        order_id: &str,
+    ) -> Result<()> {
         self.open_orders.remove(order_id);
         Ok(())
     }
@@ -58,7 +64,9 @@ impl ExecutionProvider for BybitSimulatorExecutionProvider {
                 continue;
             }
             if should_cross(&stored.request.side, stored.request.price, tick) {
-                let fee_quote = stored.request.size_base * stored.request.price * (self.taker_fee_bps / 10_000.0);
+                let fee_quote = stored.request.size_base
+                    * stored.request.price
+                    * (self.taker_fee_bps / 10_000.0);
                 self.pending_fills.push_back(FillEvent {
                     tenant_id: stored.request.tenant_id.clone(),
                     exchange: stored.request.exchange.clone(),
@@ -79,11 +87,19 @@ impl ExecutionProvider for BybitSimulatorExecutionProvider {
         Ok(())
     }
 
-    async fn flush_fills(&mut self, tenant_id: &str, exchange: &str, product_id: &str) -> Result<Vec<FillEvent>> {
+    async fn flush_fills(
+        &mut self,
+        tenant_id: &str,
+        exchange: &str,
+        product_id: &str,
+    ) -> Result<Vec<FillEvent>> {
         let mut rest = VecDeque::new();
         let mut selected = Vec::new();
         while let Some(fill) = self.pending_fills.pop_front() {
-            if fill.tenant_id == tenant_id && fill.exchange == exchange && fill.product_id == product_id {
+            if fill.tenant_id == tenant_id
+                && fill.exchange == exchange
+                && fill.product_id == product_id
+            {
                 selected.push(fill);
             } else {
                 rest.push_back(fill);
@@ -93,9 +109,16 @@ impl ExecutionProvider for BybitSimulatorExecutionProvider {
         Ok(selected)
     }
 
-    async fn liquidate_inventory(&mut self, tenant_id: &str, exchange: &str, product_id: &str) -> Result<()> {
+    async fn liquidate_inventory(
+        &mut self,
+        tenant_id: &str,
+        exchange: &str,
+        product_id: &str,
+    ) -> Result<()> {
         self.open_orders.retain(|_, o| {
-            !(o.request.tenant_id == tenant_id && o.request.exchange == exchange && o.request.product_id == product_id)
+            !(o.request.tenant_id == tenant_id
+                && o.request.exchange == exchange
+                && o.request.product_id == product_id)
         });
         Ok(())
     }

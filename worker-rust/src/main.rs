@@ -1,3 +1,5 @@
+mod config_source;
+mod control_plane;
 mod kernel;
 mod providers;
 mod publisher;

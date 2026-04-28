@@ -1,30 +1,59 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Tz;
-use serde_json::json;
+use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::{
+    config_source::{load_strategy_from_db, RuntimeSources},
+    control_plane::{RedisControlPlane, RuntimeCommand},
     kernel::{
-        types::{CloseTimezoneChangeMode, DailyCloseInput, KernelDecision, StrategyConfig, WorkerStateEvent},
+        types::{
+            CloseTimezoneChangeMode, DailyCloseInput, KernelDecision, MarketTick, StrategyConfig,
+            WorkerStateEvent,
+        },
         KernelOutput, TradingKernel,
     },
     providers::{
-        BybitLiveExecutionProvider, BybitSimulatorExecutionProvider, ExecutionProvider, MarketDataProvider,
-        SyntheticMarketDataProvider,
+        BybitLiveExecutionProvider, BybitSimulatorExecutionProvider, ExecutionProvider,
+        MarketDataProvider, SyntheticMarketDataProvider,
     },
     publisher::{StatePublisher, StdoutStatePublisher},
 };
 
+const EXEC_MODE_LIVE: &str = "live";
+const EXEC_MODE_SIMULATOR: &str = "simulator";
+const SCHEDULE_MODE_IMMEDIATE: &str = "immediate";
+const SCHEDULE_MODE_NEXT_CYCLE: &str = "next_cycle";
+
+#[derive(Debug, Default)]
+struct RuntimeCommandEffects {
+    reset_kernel: bool,
+}
+
 pub async fn run() -> Result<()> {
-    let config = load_strategy_from_env()?;
-    let mode = std::env::var("TB_EXECUTION_MODE").unwrap_or_else(|_| "simulator".to_string());
-    let tick_interval_ms = read_env_u64("TB_TICK_INTERVAL_MS", 1_000);
+    let sources = RuntimeSources::from_env()?;
+    let strategy_snapshot = load_strategy_from_db(
+        &sources.db_dsn,
+        &sources.tenant_id,
+        &sources.exchange,
+        &sources.product_id,
+    )
+    .await?;
+
+    let config = strategy_snapshot.strategy;
+    let mode = resolve_execution_mode(
+        sources.execution_mode_override.as_deref(),
+        strategy_snapshot.paper_mode,
+    );
+    let tick_interval_ms = sources.tick_interval_ms;
 
     let mut kernel = TradingKernel::new(config.clone())?;
-    let mut market_data: Box<dyn MarketDataProvider> =
-        Box::new(SyntheticMarketDataProvider::from_strategy(&config, tick_interval_ms));
+    let mut market_data: Box<dyn MarketDataProvider> = Box::new(
+        SyntheticMarketDataProvider::from_strategy(&config, tick_interval_ms),
+    );
     let mut execution: Box<dyn ExecutionProvider> = match mode.as_str() {
-        "live" => Box::new(BybitLiveExecutionProvider::default()),
+        EXEC_MODE_LIVE => Box::new(BybitLiveExecutionProvider::default()),
         _ => Box::new(BybitSimulatorExecutionProvider::default()),
     };
     let mut publisher: Box<dyn StatePublisher> = Box::new(StdoutStatePublisher);
@@ -35,8 +64,26 @@ pub async fn run() -> Result<()> {
         config.daily_close_minute,
         Utc::now(),
     )?;
-    let mut reserve_usd = read_env_f64("TB_RESERVE_USD", 0.0);
-    let session_capital_usd = read_env_f64("TB_SESSION_CAPITAL_USD", 100.0);
+
+    let mut reserve_usd = sources.reserve_usd;
+    let session_capital_usd = sources
+        .session_capital_override_usd
+        .unwrap_or(strategy_snapshot.session_capital_usd);
+    let mut skip_next_daily_close = false;
+
+    let started_at = Utc::now();
+    let session_id = format!("rust-{}", Uuid::new_v4());
+    let mut total_fills: i64 = 0;
+    let mut last_tick: Option<MarketTick> = None;
+
+    let mut control_plane = RedisControlPlane::connect(
+        &sources.redis_url,
+        &config.tenant_id,
+        &config.exchange,
+        &config.product_id,
+        "all",
+    )
+    .await?;
 
     println!(
         "{}",
@@ -51,6 +98,23 @@ pub async fn run() -> Result<()> {
         })
     );
 
+    publish_runtime_state(
+        &mut control_plane,
+        &config,
+        &mode,
+        started_at,
+        &session_id,
+        &scheduler,
+        skip_next_daily_close,
+        reserve_usd,
+        session_capital_usd,
+        total_fills,
+        &kernel,
+        last_tick.as_ref(),
+    )
+    .await?;
+    control_plane.publish_heartbeat().await?;
+
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
@@ -61,6 +125,32 @@ pub async fn run() -> Result<()> {
                 break;
             }
             tick = market_data.next_tick() => {
+                let now_utc = Utc::now();
+                let command_effects = apply_runtime_commands(
+                    control_plane.pop_commands().await?,
+                    &config,
+                    &mut scheduler,
+                    &mut skip_next_daily_close,
+                    &mut *publisher,
+                    now_utc,
+                ).await?;
+
+                if command_effects.reset_kernel {
+                    execution
+                        .liquidate_inventory(&config.tenant_id, &config.exchange, &config.product_id)
+                        .await?;
+                    kernel = TradingKernel::new(config.clone())?;
+                    let reset_applied = WorkerStateEvent {
+                        tenant_id: config.tenant_id.clone(),
+                        exchange: config.exchange.clone(),
+                        product_id: config.product_id.clone(),
+                        state_type: "kernel_reset_applied".to_string(),
+                        payload: json!({"source":"redis_command"}),
+                        emitted_at_ts_ms: now_ms(),
+                    };
+                    publisher.publish(&reset_applied).await?;
+                }
+
                 let tick = tick?;
                 execution.on_market_tick(&tick).await?;
 
@@ -73,41 +163,294 @@ pub async fn run() -> Result<()> {
                 for fill in fills {
                     let out = kernel.on_fill(&fill);
                     process_kernel_output(out, &mut *execution, &mut *publisher, &mut kernel).await?;
+                    total_fills += 1;
                 }
 
                 let now_utc = Utc::now();
                 if scheduler.should_trigger(now_utc) {
-                    let (equity_usd, daily_close_event_ts) = synthesize_equity_snapshot(&tick);
-                    let close_input = DailyCloseInput {
-                        tenant_id: tick.tenant_id.clone(),
-                        exchange: tick.exchange.clone(),
-                        product_id: tick.product_id.clone(),
-                        equity_usd,
-                        session_capital_usd,
-                        reserve_usd,
-                    };
+                    if skip_next_daily_close {
+                        skip_next_daily_close = false;
+                        let skip_event = WorkerStateEvent {
+                            tenant_id: tick.tenant_id.clone(),
+                            exchange: tick.exchange.clone(),
+                            product_id: tick.product_id.clone(),
+                            state_type: "daily_close_skipped".to_string(),
+                            payload: json!({"reason":"command_skip_daily_close"}),
+                            emitted_at_ts_ms: now_ms(),
+                        };
+                        publisher.publish(&skip_event).await?;
+                        scheduler.on_close_executed(now_utc)?;
+                    } else {
+                        let (equity_usd, daily_close_event_ts) = synthesize_equity_snapshot(&tick);
+                        let close_input = DailyCloseInput {
+                            tenant_id: tick.tenant_id.clone(),
+                            exchange: tick.exchange.clone(),
+                            product_id: tick.product_id.clone(),
+                            equity_usd,
+                            session_capital_usd,
+                            reserve_usd,
+                        };
 
-                    let (outcome, close_out) = kernel.on_daily_close(&close_input, daily_close_event_ts);
-                    reserve_usd = outcome.resulting_reserve_usd;
-                    process_kernel_output(close_out, &mut *execution, &mut *publisher, &mut kernel).await?;
+                        let (outcome, close_out) = kernel.on_daily_close(&close_input, daily_close_event_ts);
+                        reserve_usd = outcome.resulting_reserve_usd;
+                        process_kernel_output(close_out, &mut *execution, &mut *publisher, &mut kernel)
+                            .await?;
 
-                    let close_event = WorkerStateEvent {
-                        tenant_id: tick.tenant_id.clone(),
-                        exchange: tick.exchange.clone(),
-                        product_id: tick.product_id.clone(),
-                        state_type: "daily_close_outcome".to_string(),
-                        payload: serde_json::to_value(&outcome)?,
-                        emitted_at_ts_ms: daily_close_event_ts,
-                    };
-                    publisher.publish(&close_event).await?;
+                        let close_event = WorkerStateEvent {
+                            tenant_id: tick.tenant_id.clone(),
+                            exchange: tick.exchange.clone(),
+                            product_id: tick.product_id.clone(),
+                            state_type: "daily_close_outcome".to_string(),
+                            payload: serde_json::to_value(&outcome)?,
+                            emitted_at_ts_ms: daily_close_event_ts,
+                        };
+                        publisher.publish(&close_event).await?;
 
-                    scheduler.on_close_executed(now_utc)?;
+                        scheduler.on_close_executed(now_utc)?;
+                    }
                 }
+
+                last_tick = Some(tick);
+                publish_runtime_state(
+                    &mut control_plane,
+                    &config,
+                    &mode,
+                    started_at,
+                    &session_id,
+                    &scheduler,
+                    skip_next_daily_close,
+                    reserve_usd,
+                    session_capital_usd,
+                    total_fills,
+                    &kernel,
+                    last_tick.as_ref(),
+                )
+                .await?;
+                control_plane.publish_heartbeat().await?;
             }
         }
     }
 
     Ok(())
+}
+
+fn resolve_execution_mode(override_mode: Option<&str>, paper_mode: bool) -> String {
+    if let Some(mode) = override_mode {
+        let normalized = mode.trim().to_lowercase();
+        if normalized == EXEC_MODE_LIVE {
+            return EXEC_MODE_LIVE.to_string();
+        }
+        if normalized == EXEC_MODE_SIMULATOR || normalized == "paper" {
+            return EXEC_MODE_SIMULATOR.to_string();
+        }
+    }
+
+    if paper_mode {
+        EXEC_MODE_SIMULATOR.to_string()
+    } else {
+        EXEC_MODE_LIVE.to_string()
+    }
+}
+
+async fn apply_runtime_commands(
+    commands: Vec<RuntimeCommand>,
+    config: &StrategyConfig,
+    scheduler: &mut DailyCloseScheduler,
+    skip_next_daily_close: &mut bool,
+    publisher: &mut dyn StatePublisher,
+    now_utc: DateTime<Utc>,
+) -> Result<RuntimeCommandEffects> {
+    let mut effects = RuntimeCommandEffects::default();
+
+    for command in commands {
+        match command {
+            RuntimeCommand::Reset {
+                command_id,
+                product_id,
+                actor,
+                reset_type,
+            } => {
+                if !command_targets_product(&product_id, &config.product_id) {
+                    continue;
+                }
+
+                effects.reset_kernel = true;
+                let event = WorkerStateEvent {
+                    tenant_id: config.tenant_id.clone(),
+                    exchange: config.exchange.clone(),
+                    product_id: config.product_id.clone(),
+                    state_type: "command_reset_received".to_string(),
+                    payload: json!({
+                        "command_id": command_id,
+                        "reset_type": reset_type,
+                        "actor": actor,
+                    }),
+                    emitted_at_ts_ms: now_ms(),
+                };
+                publisher.publish(&event).await?;
+            }
+            RuntimeCommand::SkipDailyClose {
+                command_id,
+                product_id,
+            } => {
+                if !command_targets_product(&product_id, &config.product_id) {
+                    continue;
+                }
+
+                *skip_next_daily_close = true;
+                let event = WorkerStateEvent {
+                    tenant_id: config.tenant_id.clone(),
+                    exchange: config.exchange.clone(),
+                    product_id: config.product_id.clone(),
+                    state_type: "command_skip_daily_close_received".to_string(),
+                    payload: json!({
+                        "command_id": command_id,
+                    }),
+                    emitted_at_ts_ms: now_ms(),
+                };
+                publisher.publish(&event).await?;
+            }
+            RuntimeCommand::UpdateDailyCloseSchedule {
+                command_id,
+                product_id,
+                local_timezone_iana,
+                daily_close_hour,
+                daily_close_minute,
+                mode,
+            } => {
+                if !command_targets_product(&product_id, &config.product_id) {
+                    continue;
+                }
+
+                let schedule_mode = match parse_schedule_mode(&mode) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let event = WorkerStateEvent {
+                            tenant_id: config.tenant_id.clone(),
+                            exchange: config.exchange.clone(),
+                            product_id: config.product_id.clone(),
+                            state_type: "command_schedule_rejected".to_string(),
+                            payload: json!({
+                                "command_id": command_id,
+                                "reason": "invalid_mode",
+                                "mode": mode,
+                            }),
+                            emitted_at_ts_ms: now_ms(),
+                        };
+                        publisher.publish(&event).await?;
+                        continue;
+                    }
+                };
+
+                if scheduler
+                    .apply_schedule_change(
+                        &local_timezone_iana,
+                        daily_close_hour,
+                        daily_close_minute,
+                        schedule_mode,
+                        now_utc,
+                    )
+                    .is_err()
+                {
+                    let event = WorkerStateEvent {
+                        tenant_id: config.tenant_id.clone(),
+                        exchange: config.exchange.clone(),
+                        product_id: config.product_id.clone(),
+                        state_type: "command_schedule_rejected".to_string(),
+                        payload: json!({
+                            "command_id": command_id,
+                            "reason": "invalid_timezone_or_time",
+                            "local_timezone_iana": local_timezone_iana,
+                            "daily_close_hour": daily_close_hour,
+                            "daily_close_minute": daily_close_minute,
+                        }),
+                        emitted_at_ts_ms: now_ms(),
+                    };
+                    publisher.publish(&event).await?;
+                    continue;
+                }
+
+                let event = WorkerStateEvent {
+                    tenant_id: config.tenant_id.clone(),
+                    exchange: config.exchange.clone(),
+                    product_id: config.product_id.clone(),
+                    state_type: "daily_close_schedule_updated".to_string(),
+                    payload: json!({
+                        "command_id": command_id,
+                        "mode": mode,
+                        "daily_close_schedule": scheduler.schedule_payload(),
+                        "pending_daily_close_schedule": scheduler.pending_schedule_payload(),
+                    }),
+                    emitted_at_ts_ms: now_ms(),
+                };
+                publisher.publish(&event).await?;
+            }
+        }
+    }
+
+    Ok(effects)
+}
+
+fn command_targets_product(command_product_id: &str, runtime_product_id: &str) -> bool {
+    command_product_id.eq_ignore_ascii_case("all")
+        || command_product_id.eq_ignore_ascii_case(runtime_product_id)
+}
+
+fn parse_schedule_mode(raw: &str) -> Result<CloseTimezoneChangeMode> {
+    let normalized = raw.trim().to_lowercase();
+    match normalized.as_str() {
+        SCHEDULE_MODE_IMMEDIATE => Ok(CloseTimezoneChangeMode::Immediate),
+        "" | SCHEDULE_MODE_NEXT_CYCLE => Ok(CloseTimezoneChangeMode::NextCycle),
+        _ => Err(anyhow!("invalid schedule mode '{normalized}'")),
+    }
+}
+
+async fn publish_runtime_state(
+    control_plane: &mut RedisControlPlane,
+    config: &StrategyConfig,
+    mode: &str,
+    started_at: DateTime<Utc>,
+    session_id: &str,
+    scheduler: &DailyCloseScheduler,
+    skip_next_daily_close: bool,
+    reserve_usd: f64,
+    session_capital_usd: f64,
+    total_fills: i64,
+    kernel: &TradingKernel,
+    last_tick: Option<&MarketTick>,
+) -> Result<()> {
+    let now_utc = Utc::now();
+    let uptime = (now_utc - started_at).num_seconds().max(0);
+
+    let mut state = json!({
+        "mode": mode,
+        "started_at": started_at.to_rfc3339(),
+        "uptime_seconds": uptime,
+        "session_uptime_seconds": uptime,
+        "session_id": session_id,
+        "tenant_id": config.tenant_id,
+        "exchange": config.exchange,
+        "product_id": config.product_id,
+        "next_daily_close_at": scheduler.next_close_utc().to_rfc3339(),
+        "daily_close_schedule": scheduler.schedule_payload(),
+        "pending_daily_close_schedule": scheduler.pending_schedule_payload(),
+        "skip_daily_close": skip_next_daily_close,
+        "reserve_usd": reserve_usd,
+        "session_capital_usd": session_capital_usd,
+        "total_fills": total_fills,
+        "open_order_count": kernel.active_order_count(),
+        "reference_mid": kernel.reference_mid(),
+        "updated_at": now_utc.to_rfc3339(),
+    });
+
+    if let Some(tick) = last_tick {
+        state["last_tick_mid"] = json!(tick.mid);
+        state["last_tick_ts_ms"] = json!(tick.event_ts_ms);
+        state["last_tick_bid"] = json!(tick.bid);
+        state["last_tick_ask"] = json!(tick.ask);
+    }
+
+    control_plane.publish_state(state).await
 }
 
 async fn process_kernel_output(
@@ -189,73 +532,6 @@ async fn process_kernel_output(
     Ok(())
 }
 
-fn load_strategy_from_env() -> Result<StrategyConfig> {
-    let tenant_id = std::env::var("TB_TENANT_ID")
-        .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000001".to_string());
-    let exchange = std::env::var("TB_EXCHANGE").unwrap_or_else(|_| "bybit".to_string());
-    let product_id = std::env::var("TB_PRODUCT_ID").unwrap_or_else(|_| "SOL-USD".to_string());
-
-    let spacing_bps = read_required_env_f64("TB_SPACING_BPS")
-        .context("TB_SPACING_BPS is required (fail-fast if config is incomplete)")?;
-    let rebalance_threshold_bps = read_required_env_f64("TB_REBALANCE_THRESHOLD_BPS")
-        .context("TB_REBALANCE_THRESHOLD_BPS is required (fail-fast if config is incomplete)")?;
-    let grid_levels = read_required_env_i32("TB_GRID_LEVELS")
-        .context("TB_GRID_LEVELS is required (fail-fast if config is incomplete)")?;
-    let level_size_quote = read_required_env_f64("TB_LEVEL_SIZE_QUOTE")
-        .context("TB_LEVEL_SIZE_QUOTE is required (fail-fast if config is incomplete)")?;
-    let local_timezone_iana = std::env::var("TB_LOCAL_TIMEZONE_IANA")
-        .context("TB_LOCAL_TIMEZONE_IANA is required (fail-fast if config is incomplete)")?;
-    let daily_close_hour = read_required_env_u8("TB_DAILY_CLOSE_HOUR")
-        .context("TB_DAILY_CLOSE_HOUR is required (fail-fast if config is incomplete)")?;
-    let daily_close_minute = read_required_env_u8("TB_DAILY_CLOSE_MINUTE")
-        .context("TB_DAILY_CLOSE_MINUTE is required (fail-fast if config is incomplete)")?;
-
-    Ok(StrategyConfig {
-        tenant_id,
-        exchange,
-        product_id,
-        spacing_bps,
-        rebalance_threshold_bps,
-        grid_levels,
-        level_size_quote,
-        local_timezone_iana,
-        daily_close_hour,
-        daily_close_minute,
-    })
-}
-
-fn read_required_env_f64(key: &str) -> Result<f64> {
-    let raw = std::env::var(key).map_err(|_| anyhow!("{key} not set"))?;
-    raw.parse::<f64>()
-        .map_err(|e| anyhow!("{key} must be numeric: {e}"))
-}
-
-fn read_required_env_i32(key: &str) -> Result<i32> {
-    let raw = std::env::var(key).map_err(|_| anyhow!("{key} not set"))?;
-    raw.parse::<i32>()
-        .map_err(|e| anyhow!("{key} must be integer: {e}"))
-}
-
-fn read_required_env_u8(key: &str) -> Result<u8> {
-    let raw = std::env::var(key).map_err(|_| anyhow!("{key} not set"))?;
-    raw.parse::<u8>()
-        .map_err(|e| anyhow!("{key} must be integer in [0,255]: {e}"))
-}
-
-fn read_env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|x| x.parse::<f64>().ok())
-        .unwrap_or(default)
-}
-
-fn read_env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|x| x.parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -265,35 +541,47 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-fn synthesize_equity_snapshot(tick: &crate::kernel::types::MarketTick) -> (f64, i64) {
+fn synthesize_equity_snapshot(tick: &MarketTick) -> (f64, i64) {
     // Placeholder hook: in production this will read equity from tenant/par runtime state.
     let synthetic_equity = tick.mid;
     (synthetic_equity, tick.event_ts_ms)
+}
+
+#[derive(Debug, Clone)]
+struct PendingSchedule {
+    timezone_iana: String,
+    close_hour: u8,
+    close_minute: u8,
 }
 
 #[derive(Debug)]
 struct DailyCloseScheduler {
     active_timezone_name: String,
     active_timezone: Tz,
-    pending_timezone_name: Option<String>,
     close_hour: u8,
     close_minute: u8,
+    pending_schedule: Option<PendingSchedule>,
     next_close_utc: DateTime<Utc>,
 }
 
 impl DailyCloseScheduler {
-    fn new(timezone_iana: &str, close_hour: u8, close_minute: u8, now_utc: DateTime<Utc>) -> Result<Self> {
-        let active_timezone: Tz = timezone_iana
-            .parse()
-            .map_err(|_| anyhow!("invalid timezone IANA: {timezone_iana}"))?;
+    fn new(
+        timezone_iana: &str,
+        close_hour: u8,
+        close_minute: u8,
+        now_utc: DateTime<Utc>,
+    ) -> Result<Self> {
+        let active_timezone = parse_timezone(timezone_iana)?;
         validate_close_time(close_hour, close_minute)?;
-        let next_close_utc = compute_next_close_utc(active_timezone, close_hour, close_minute, now_utc)?;
+        let next_close_utc =
+            compute_next_close_utc(active_timezone, close_hour, close_minute, now_utc)?;
+
         Ok(Self {
             active_timezone_name: timezone_iana.to_string(),
             active_timezone,
-            pending_timezone_name: None,
             close_hour,
             close_minute,
+            pending_schedule: None,
             next_close_utc,
         })
     }
@@ -303,40 +591,56 @@ impl DailyCloseScheduler {
     }
 
     fn on_close_executed(&mut self, now_utc: DateTime<Utc>) -> Result<()> {
-        if let Some(next_tz) = self.pending_timezone_name.take() {
-            let parsed: Tz = next_tz
-                .parse()
-                .map_err(|_| anyhow!("invalid pending timezone IANA: {next_tz}"))?;
-            self.active_timezone = parsed;
-            self.active_timezone_name = next_tz;
+        if let Some(pending) = self.pending_schedule.take() {
+            self.active_timezone = parse_timezone(&pending.timezone_iana)?;
+            self.active_timezone_name = pending.timezone_iana;
+            self.close_hour = pending.close_hour;
+            self.close_minute = pending.close_minute;
         }
-        self.next_close_utc =
-            compute_next_close_utc(self.active_timezone, self.close_hour, self.close_minute, now_utc)?;
+
+        self.next_close_utc = compute_next_close_utc(
+            self.active_timezone,
+            self.close_hour,
+            self.close_minute,
+            now_utc,
+        )?;
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn apply_timezone_change(
+    fn apply_schedule_change(
         &mut self,
         timezone_iana: &str,
+        close_hour: u8,
+        close_minute: u8,
         mode: CloseTimezoneChangeMode,
         now_utc: DateTime<Utc>,
     ) -> Result<()> {
-        let parsed: Tz = timezone_iana
-            .parse()
-            .map_err(|_| anyhow!("invalid timezone IANA: {timezone_iana}"))?;
+        validate_close_time(close_hour, close_minute)?;
+        let parsed_tz = parse_timezone(timezone_iana)?;
+
         match mode {
             CloseTimezoneChangeMode::NextCycle => {
-                self.pending_timezone_name = Some(timezone_iana.to_string());
+                self.pending_schedule = Some(PendingSchedule {
+                    timezone_iana: timezone_iana.to_string(),
+                    close_hour,
+                    close_minute,
+                });
             }
             CloseTimezoneChangeMode::Immediate => {
-                self.pending_timezone_name = None;
-                self.active_timezone = parsed;
+                self.pending_schedule = None;
+                self.active_timezone = parsed_tz;
                 self.active_timezone_name = timezone_iana.to_string();
-                self.next_close_utc =
-                    compute_next_close_utc(self.active_timezone, self.close_hour, self.close_minute, now_utc)?;
+                self.close_hour = close_hour;
+                self.close_minute = close_minute;
+                self.next_close_utc = compute_next_close_utc(
+                    self.active_timezone,
+                    self.close_hour,
+                    self.close_minute,
+                    now_utc,
+                )?;
             }
         }
+
         Ok(())
     }
 
@@ -347,6 +651,30 @@ impl DailyCloseScheduler {
     fn session_timezone_iana(&self) -> &str {
         &self.active_timezone_name
     }
+
+    fn schedule_payload(&self) -> Value {
+        json!({
+            "local_timezone_iana": self.active_timezone_name,
+            "daily_close_hour": self.close_hour,
+            "daily_close_minute": self.close_minute,
+        })
+    }
+
+    fn pending_schedule_payload(&self) -> Option<Value> {
+        self.pending_schedule.as_ref().map(|pending| {
+            json!({
+                "local_timezone_iana": pending.timezone_iana,
+                "daily_close_hour": pending.close_hour,
+                "daily_close_minute": pending.close_minute,
+            })
+        })
+    }
+}
+
+fn parse_timezone(timezone_iana: &str) -> Result<Tz> {
+    timezone_iana
+        .parse()
+        .map_err(|_| anyhow!("invalid timezone IANA: {timezone_iana}"))
 }
 
 fn validate_close_time(hour: u8, minute: u8) -> Result<()> {
@@ -359,7 +687,12 @@ fn validate_close_time(hour: u8, minute: u8) -> Result<()> {
     Ok(())
 }
 
-fn compute_next_close_utc(tz: Tz, close_hour: u8, close_minute: u8, now_utc: DateTime<Utc>) -> Result<DateTime<Utc>> {
+fn compute_next_close_utc(
+    tz: Tz,
+    close_hour: u8,
+    close_minute: u8,
+    now_utc: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
     let local_now = now_utc.with_timezone(&tz);
     let today = local_now.date_naive();
 
@@ -370,6 +703,7 @@ fn compute_next_close_utc(tz: Tz, close_hour: u8, close_minute: u8, now_utc: Dat
     } else {
         today_close
     };
+
     Ok(next_local_close.with_timezone(&Utc))
 }
 
@@ -399,39 +733,71 @@ mod tests {
     use chrono::Duration;
 
     #[test]
-    fn next_cycle_keeps_original_timezone_until_close() {
+    fn next_cycle_keeps_active_schedule_until_close() {
         let now_utc = Utc
             .with_ymd_and_hms(2026, 4, 20, 8, 0, 0)
             .single()
             .expect("valid dt");
-        let mut scheduler = DailyCloseScheduler::new("Europe/Amsterdam", 0, 0, now_utc).expect("scheduler");
+        let mut scheduler =
+            DailyCloseScheduler::new("Europe/Amsterdam", 0, 0, now_utc).expect("scheduler");
         let baseline_next_close = scheduler.next_close_utc();
 
         scheduler
-            .apply_timezone_change("Asia/Singapore", CloseTimezoneChangeMode::NextCycle, now_utc)
+            .apply_schedule_change(
+                "Asia/Singapore",
+                1,
+                30,
+                CloseTimezoneChangeMode::NextCycle,
+                now_utc,
+            )
             .expect("apply change");
+
         assert_eq!(scheduler.session_timezone_iana(), "Europe/Amsterdam");
         assert_eq!(scheduler.next_close_utc(), baseline_next_close);
+        assert_eq!(scheduler.schedule_payload()["daily_close_hour"], 0);
+        assert_eq!(scheduler.schedule_payload()["daily_close_minute"], 0);
+
+        let pending = scheduler
+            .pending_schedule_payload()
+            .expect("pending schedule expected");
+        assert_eq!(pending["local_timezone_iana"], "Asia/Singapore");
+        assert_eq!(pending["daily_close_hour"], 1);
+        assert_eq!(pending["daily_close_minute"], 30);
 
         let after_close = baseline_next_close + Duration::seconds(1);
-        scheduler.on_close_executed(after_close).expect("roll close");
+        scheduler
+            .on_close_executed(after_close)
+            .expect("roll close");
+
         assert_eq!(scheduler.session_timezone_iana(), "Asia/Singapore");
+        assert_eq!(scheduler.schedule_payload()["daily_close_hour"], 1);
+        assert_eq!(scheduler.schedule_payload()["daily_close_minute"], 30);
     }
 
     #[test]
-    fn immediate_timezone_change_recomputes_next_close() {
+    fn immediate_schedule_change_recomputes_next_close() {
         let now_utc = Utc
             .with_ymd_and_hms(2026, 4, 20, 8, 0, 0)
             .single()
             .expect("valid dt");
-        let mut scheduler = DailyCloseScheduler::new("Europe/Amsterdam", 0, 0, now_utc).expect("scheduler");
+        let mut scheduler =
+            DailyCloseScheduler::new("Europe/Amsterdam", 0, 0, now_utc).expect("scheduler");
         let prev = scheduler.next_close_utc();
 
         scheduler
-            .apply_timezone_change("Asia/Singapore", CloseTimezoneChangeMode::Immediate, now_utc)
+            .apply_schedule_change(
+                "Asia/Singapore",
+                3,
+                15,
+                CloseTimezoneChangeMode::Immediate,
+                now_utc,
+            )
             .expect("apply immediate");
 
         assert_eq!(scheduler.session_timezone_iana(), "Asia/Singapore");
+        assert_eq!(scheduler.schedule_payload()["daily_close_hour"], 3);
+        assert_eq!(scheduler.schedule_payload()["daily_close_minute"], 15);
         assert_ne!(scheduler.next_close_utc(), prev);
+        assert!(scheduler.pending_schedule_payload().is_none());
     }
 }

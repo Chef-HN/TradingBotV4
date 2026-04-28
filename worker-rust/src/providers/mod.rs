@@ -19,8 +19,24 @@ pub trait MarketDataProvider: Send {
 #[async_trait]
 pub trait ExecutionProvider: Send {
     async fn submit(&mut self, request: &OrderRequest) -> Result<String>;
-    async fn cancel(&mut self, tenant_id: &str, exchange: &str, product_id: &str, order_id: &str) -> Result<()>;
+    async fn cancel(
+        &mut self,
+        tenant_id: &str,
+        exchange: &str,
+        product_id: &str,
+        order_id: &str,
+    ) -> Result<()>;
     async fn on_market_tick(&mut self, tick: &MarketTick) -> Result<()>;
-    async fn flush_fills(&mut self, tenant_id: &str, exchange: &str, product_id: &str) -> Result<Vec<FillEvent>>;
-    async fn liquidate_inventory(&mut self, tenant_id: &str, exchange: &str, product_id: &str) -> Result<()>;
+    async fn flush_fills(
+        &mut self,
+        tenant_id: &str,
+        exchange: &str,
+        product_id: &str,
+    ) -> Result<Vec<FillEvent>>;
+    async fn liquidate_inventory(
+        &mut self,
+        tenant_id: &str,
+        exchange: &str,
+        product_id: &str,
+    ) -> Result<()>;
 }

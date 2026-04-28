@@ -25,7 +25,13 @@ impl ExecutionProvider for BybitLiveExecutionProvider {
         ))
     }
 
-    async fn cancel(&mut self, _tenant_id: &str, _exchange: &str, _product_id: &str, _order_id: &str) -> Result<()> {
+    async fn cancel(
+        &mut self,
+        _tenant_id: &str,
+        _exchange: &str,
+        _product_id: &str,
+        _order_id: &str,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -33,11 +39,21 @@ impl ExecutionProvider for BybitLiveExecutionProvider {
         Ok(())
     }
 
-    async fn flush_fills(&mut self, _tenant_id: &str, _exchange: &str, _product_id: &str) -> Result<Vec<FillEvent>> {
+    async fn flush_fills(
+        &mut self,
+        _tenant_id: &str,
+        _exchange: &str,
+        _product_id: &str,
+    ) -> Result<Vec<FillEvent>> {
         Ok(Vec::new())
     }
 
-    async fn liquidate_inventory(&mut self, _tenant_id: &str, _exchange: &str, _product_id: &str) -> Result<()> {
+    async fn liquidate_inventory(
+        &mut self,
+        _tenant_id: &str,
+        _exchange: &str,
+        _product_id: &str,
+    ) -> Result<()> {
         Ok(())
     }
 }
