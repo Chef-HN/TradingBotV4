@@ -25,6 +25,7 @@ const EXEC_MODE_LIVE: &str = "live";
 const EXEC_MODE_SIMULATOR: &str = "simulator";
 const SCHEDULE_MODE_IMMEDIATE: &str = "immediate";
 const SCHEDULE_MODE_NEXT_CYCLE: &str = "next_cycle";
+const ENV_ALLOW_RESET_COMMAND: &str = "TB_ALLOW_RESET_COMMAND";
 
 #[derive(Debug, Default)]
 struct RuntimeCommandEffects {
@@ -47,6 +48,7 @@ pub async fn run() -> Result<()> {
         strategy_snapshot.paper_mode,
     );
     let tick_interval_ms = sources.tick_interval_ms;
+    let allow_reset_command = read_env_bool(ENV_ALLOW_RESET_COMMAND, false);
 
     let mut kernel = TradingKernel::new(config.clone())?;
     let mut market_data: Box<dyn MarketDataProvider> = Box::new(
@@ -131,6 +133,7 @@ pub async fn run() -> Result<()> {
                     &config,
                     &mut scheduler,
                     &mut skip_next_daily_close,
+                    allow_reset_command,
                     &mut *publisher,
                     now_utc,
                 ).await?;
@@ -252,11 +255,22 @@ fn resolve_execution_mode(override_mode: Option<&str>, paper_mode: bool) -> Stri
     }
 }
 
+fn read_env_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(raw) => {
+            let normalized = raw.trim().to_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => default,
+    }
+}
+
 async fn apply_runtime_commands(
     commands: Vec<RuntimeCommand>,
     config: &StrategyConfig,
     scheduler: &mut DailyCloseScheduler,
     skip_next_daily_close: &mut bool,
+    allow_reset_command: bool,
     publisher: &mut dyn StatePublisher,
     now_utc: DateTime<Utc>,
 ) -> Result<RuntimeCommandEffects> {
@@ -271,6 +285,22 @@ async fn apply_runtime_commands(
                 reset_type,
             } => {
                 if !command_targets_product(&product_id, &config.product_id) {
+                    continue;
+                }
+
+                if !allow_reset_command {
+                    let event = WorkerStateEvent {
+                        tenant_id: config.tenant_id.clone(),
+                        exchange: config.exchange.clone(),
+                        product_id: config.product_id.clone(),
+                        state_type: "command_reset_ignored".to_string(),
+                        payload: json!({
+                            "command_id": command_id,
+                            "reason": format!("{ENV_ALLOW_RESET_COMMAND}=false"),
+                        }),
+                        emitted_at_ts_ms: now_ms(),
+                    };
+                    publisher.publish(&event).await?;
                     continue;
                 }
 
