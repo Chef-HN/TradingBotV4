@@ -1,4 +1,5 @@
 mod bybit_live;
+mod bybit_market_data;
 mod bybit_simulator;
 mod market_data;
 
@@ -8,6 +9,7 @@ use async_trait::async_trait;
 use crate::kernel::types::{FillEvent, MarketTick, OrderRequest};
 
 pub use bybit_live::BybitLiveExecutionProvider;
+pub use bybit_market_data::BybitRestMarketDataProvider;
 pub use bybit_simulator::BybitSimulatorExecutionProvider;
 pub use market_data::{ReplayMarketDataProvider, SyntheticMarketDataProvider};
 

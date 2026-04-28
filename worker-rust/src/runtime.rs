@@ -15,14 +15,18 @@ use crate::{
         KernelOutput, TradingKernel,
     },
     providers::{
-        BybitLiveExecutionProvider, BybitSimulatorExecutionProvider, ExecutionProvider,
-        MarketDataProvider, SyntheticMarketDataProvider,
+        BybitLiveExecutionProvider, BybitRestMarketDataProvider, BybitSimulatorExecutionProvider,
+        ExecutionProvider, MarketDataProvider, ReplayMarketDataProvider,
+        SyntheticMarketDataProvider,
     },
     publisher::{StatePublisher, StdoutStatePublisher},
 };
 
 const EXEC_MODE_LIVE: &str = "live";
 const EXEC_MODE_SIMULATOR: &str = "simulator";
+const MARKET_DATA_SYNTHETIC: &str = "synthetic";
+const MARKET_DATA_REPLAY: &str = "replay";
+const MARKET_DATA_BYBIT_REST: &str = "bybit_rest";
 const SCHEDULE_MODE_IMMEDIATE: &str = "immediate";
 const SCHEDULE_MODE_NEXT_CYCLE: &str = "next_cycle";
 const ENV_ALLOW_RESET_COMMAND: &str = "TB_ALLOW_RESET_COMMAND";
@@ -49,11 +53,10 @@ pub async fn run() -> Result<()> {
     );
     let tick_interval_ms = sources.tick_interval_ms;
     let allow_reset_command = read_env_bool(ENV_ALLOW_RESET_COMMAND, false);
+    let (market_data_provider_name, mut market_data) =
+        build_market_data_provider(&config, &mode, tick_interval_ms)?;
 
     let mut kernel = TradingKernel::new(config.clone())?;
-    let mut market_data: Box<dyn MarketDataProvider> = Box::new(
-        SyntheticMarketDataProvider::from_strategy(&config, tick_interval_ms),
-    );
     let mut execution: Box<dyn ExecutionProvider> = match mode.as_str() {
         EXEC_MODE_LIVE => Box::new(BybitLiveExecutionProvider::default()),
         _ => Box::new(BybitSimulatorExecutionProvider::default()),
@@ -95,6 +98,7 @@ pub async fn run() -> Result<()> {
             "exchange": config.exchange,
             "product_id": config.product_id,
             "execution_mode": mode,
+            "market_data_provider": market_data_provider_name,
             "session_timezone_iana": scheduler.session_timezone_iana(),
             "next_close_utc": scheduler.next_close_utc().to_rfc3339(),
         })
@@ -252,6 +256,52 @@ fn resolve_execution_mode(override_mode: Option<&str>, paper_mode: bool) -> Stri
         EXEC_MODE_SIMULATOR.to_string()
     } else {
         EXEC_MODE_LIVE.to_string()
+    }
+}
+
+fn build_market_data_provider(
+    config: &StrategyConfig,
+    execution_mode: &str,
+    tick_interval_ms: u64,
+) -> Result<(String, Box<dyn MarketDataProvider>)> {
+    let selected = std::env::var("TB_MARKET_DATA_PROVIDER")
+        .ok()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            if execution_mode == EXEC_MODE_LIVE {
+                MARKET_DATA_BYBIT_REST.to_string()
+            } else {
+                MARKET_DATA_SYNTHETIC.to_string()
+            }
+        });
+
+    match selected.as_str() {
+        MARKET_DATA_BYBIT_REST => Ok((
+            selected,
+            Box::new(BybitRestMarketDataProvider::from_strategy(
+                config,
+                tick_interval_ms,
+            )?),
+        )),
+        MARKET_DATA_REPLAY | "replay_json" | "replay_jsonl" => {
+            let replay_path = std::env::var("TB_REPLAY_TICKS_PATH")
+                .map_err(|_| anyhow!("TB_REPLAY_TICKS_PATH is required for replay market data mode"))?;
+            Ok((
+                selected,
+                Box::new(ReplayMarketDataProvider::from_path(replay_path.trim())?),
+            ))
+        }
+        MARKET_DATA_SYNTHETIC => Ok((
+            selected,
+            Box::new(SyntheticMarketDataProvider::from_strategy(
+                config,
+                tick_interval_ms,
+            )),
+        )),
+        other => Err(anyhow!(
+            "unsupported TB_MARKET_DATA_PROVIDER='{other}'. expected one of: {MARKET_DATA_BYBIT_REST}, {MARKET_DATA_REPLAY}, {MARKET_DATA_SYNTHETIC}"
+        )),
     }
 }
 

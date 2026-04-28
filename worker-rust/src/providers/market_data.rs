@@ -1,6 +1,6 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, fs, time::Duration};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 
 use crate::kernel::types::{MarketTick, StrategyConfig};
@@ -16,6 +16,17 @@ impl ReplayMarketDataProvider {
         Self {
             queue: ticks.into_iter().collect(),
         }
+    }
+
+    pub fn from_path(path: &str) -> Result<Self> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read replay file '{path}'"))?;
+        let ticks = parse_ticks_document(&raw)
+            .with_context(|| format!("failed to parse replay ticks from '{path}'"))?;
+        if ticks.is_empty() {
+            return Err(anyhow!("replay file '{path}' has no ticks"));
+        }
+        Ok(Self::new(ticks))
     }
 }
 
@@ -81,4 +92,54 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or_default()
+}
+
+fn parse_ticks_document(raw: &str) -> Result<Vec<MarketTick>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if trimmed.starts_with('[') {
+        return serde_json::from_str::<Vec<MarketTick>>(trimmed)
+            .context("expected JSON array of MarketTick");
+    }
+
+    let mut ticks = Vec::new();
+    for (index, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let tick = serde_json::from_str::<MarketTick>(line)
+            .with_context(|| format!("invalid json line {}", index + 1))?;
+        ticks.push(tick);
+    }
+    Ok(ticks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ticks_accepts_json_array() {
+        let ticks = parse_ticks_document(
+            r#"[{"tenant_id":"t1","exchange":"bybit","product_id":"SOL-USD","bid":100.0,"ask":100.2,"mid":100.1,"event_ts_ms":1}]"#,
+        )
+        .expect("parsed");
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].product_id, "SOL-USD");
+    }
+
+    #[test]
+    fn parse_ticks_accepts_json_lines() {
+        let ticks = parse_ticks_document(
+            r#"{"tenant_id":"t1","exchange":"bybit","product_id":"DOGE-USD","bid":0.15,"ask":0.151,"mid":0.1505,"event_ts_ms":1}
+{"tenant_id":"t1","exchange":"bybit","product_id":"DOGE-USD","bid":0.151,"ask":0.152,"mid":0.1515,"event_ts_ms":2}"#,
+        )
+        .expect("parsed");
+        assert_eq!(ticks.len(), 2);
+        assert_eq!(ticks[1].event_ts_ms, 2);
+    }
 }
