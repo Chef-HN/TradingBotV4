@@ -46,6 +46,13 @@ pub struct RedisControlPlane {
     conn: MultiplexedConnection,
 }
 
+#[derive(Debug)]
+struct CommandScope<'a> {
+    tenant_id: &'a str,
+    exchange: &'a str,
+    product_id: &'a str,
+}
+
 impl RedisControlPlane {
     pub async fn connect(
         redis_url: &str,
@@ -136,101 +143,112 @@ impl RedisControlPlane {
     }
 
     fn parse_command(&self, raw: &str) -> Result<Option<RuntimeCommand>> {
-        let envelope: CommandEnvelope = match serde_json::from_str(raw) {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
-        };
+        parse_command_for_scope(
+            raw,
+            &CommandScope {
+                tenant_id: &self.tenant_id,
+                exchange: &self.exchange,
+                product_id: &self.product_id,
+            },
+        )
+    }
+}
 
-        let cmd_type = envelope
-            .command_type
-            .or(envelope.legacy_type)
-            .map(|v| v.trim().to_lowercase())
-            .unwrap_or_default();
-        if cmd_type.is_empty() {
-            return Ok(None);
-        }
+fn parse_command_for_scope(raw: &str, scope: &CommandScope<'_>) -> Result<Option<RuntimeCommand>> {
+    let envelope: CommandEnvelope = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
 
-        let tenant = envelope
-            .tenant_id
-            .map(|x| x.to_lowercase())
-            .unwrap_or_else(|| self.tenant_id.clone());
-        let exchange = envelope
-            .exchange
-            .map(|x| x.to_lowercase())
-            .unwrap_or_else(|| self.exchange.clone());
-        if tenant != self.tenant_id || exchange != self.exchange {
-            return Ok(None);
-        }
+    let cmd_type = envelope
+        .command_type
+        .or(envelope.legacy_type)
+        .map(|v| v.trim().to_lowercase())
+        .unwrap_or_default();
+    if cmd_type.is_empty() {
+        return Ok(None);
+    }
 
-        let product_id = normalize_product(envelope.product_id.as_deref().unwrap_or("all"), "all");
-        if product_id != "all" && product_id != self.product_id {
-            return Ok(None);
-        }
+    let tenant = envelope
+        .tenant_id
+        .map(|x| x.to_lowercase())
+        .unwrap_or_else(|| scope.tenant_id.to_lowercase());
+    let exchange = envelope
+        .exchange
+        .map(|x| x.to_lowercase())
+        .unwrap_or_else(|| scope.exchange.to_lowercase());
+    if tenant != scope.tenant_id || exchange != scope.exchange {
+        return Ok(None);
+    }
 
-        let command_id = envelope
-            .command_id
-            .unwrap_or_else(|| format!("redis-{}", now_ms()));
+    let product_id = normalize_product(envelope.product_id.as_deref().unwrap_or("all"), "all");
+    if product_id != "all" && product_id != scope.product_id {
+        return Ok(None);
+    }
 
-        let payload = merged_payload(envelope.payload, envelope.extra);
-        match cmd_type.as_str() {
-            COMMAND_RESET => {
-                let reset_type = payload
-                    .get("reset_type")
+    let command_id = envelope
+        .command_id
+        .unwrap_or_else(|| format!("redis-{}", now_ms()));
+
+    let payload = merged_payload(envelope.payload, envelope.extra);
+    match cmd_type.as_str() {
+        COMMAND_RESET => {
+            let reset_type = payload
+                .get("reset_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("daily_close")
+                .trim()
+                .to_lowercase();
+            let actor = envelope.actor.or_else(|| {
+                payload
+                    .get("triggered_by")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("daily_close")
-                    .trim()
-                    .to_lowercase();
-                let actor = envelope.actor.or_else(|| {
-                    payload
-                        .get("triggered_by")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                });
-                Ok(Some(RuntimeCommand::Reset {
-                    command_id,
-                    product_id,
-                    actor,
-                    reset_type,
-                }))
-            }
-            COMMAND_SKIP_DAILY_CLOSE => Ok(Some(RuntimeCommand::SkipDailyClose {
+                    .map(|s| s.to_string())
+            });
+            Ok(Some(RuntimeCommand::Reset {
                 command_id,
                 product_id,
-            })),
-            COMMAND_UPDATE_DAILY_CLOSE_SCHEDULE => {
-                let tz = payload
-                    .get("local_timezone_iana")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("command missing local_timezone_iana"))?
-                    .to_string();
-                let hour = payload
-                    .get("daily_close_hour")
-                    .and_then(as_i64)
-                    .ok_or_else(|| anyhow!("command missing daily_close_hour"))?;
-                let minute = payload
-                    .get("daily_close_minute")
-                    .and_then(as_i64)
-                    .ok_or_else(|| anyhow!("command missing daily_close_minute"))?;
-                if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
-                    return Ok(None);
-                }
-                let mode = payload
-                    .get("mode")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("next_cycle")
-                    .trim()
-                    .to_lowercase();
-                Ok(Some(RuntimeCommand::UpdateDailyCloseSchedule {
-                    command_id,
-                    product_id,
-                    local_timezone_iana: tz,
-                    daily_close_hour: hour as u8,
-                    daily_close_minute: minute as u8,
-                    mode,
-                }))
-            }
-            _ => Ok(None),
+                actor,
+                reset_type,
+            }))
         }
+        COMMAND_SKIP_DAILY_CLOSE => Ok(Some(RuntimeCommand::SkipDailyClose {
+            command_id,
+            product_id,
+        })),
+        COMMAND_UPDATE_DAILY_CLOSE_SCHEDULE => {
+            let tz = payload
+                .get("local_timezone_iana")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("command missing local_timezone_iana"))?
+                .to_string();
+            let hour = payload
+                .get("daily_close_hour")
+                .and_then(as_i64)
+                .ok_or_else(|| anyhow!("command missing daily_close_hour"))?;
+            let minute = payload
+                .get("daily_close_minute")
+                .and_then(as_i64)
+                .ok_or_else(|| anyhow!("command missing daily_close_minute"))?;
+            if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
+                return Ok(None);
+            }
+            let mode = payload
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("next_cycle")
+                .trim()
+                .to_lowercase();
+            Ok(Some(RuntimeCommand::UpdateDailyCloseSchedule {
+                command_id,
+                product_id,
+                local_timezone_iana: tz,
+                daily_close_hour: hour as u8,
+                daily_close_minute: minute as u8,
+                mode,
+            }))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -324,5 +342,138 @@ mod tests {
         assert_eq!(as_i64(&json!(7)), Some(7));
         assert_eq!(as_i64(&json!("8")), Some(8));
         assert_eq!(as_i64(&json!("x")), None);
+    }
+
+    #[test]
+    fn parse_schedule_command_nested_payload() {
+        let raw = json!({
+            "command_type":"update_daily_close_schedule",
+            "tenant_id":"t1",
+            "exchange":"bybit",
+            "product_id":"SOL-USD",
+            "payload":{
+                "local_timezone_iana":"Asia/Singapore",
+                "daily_close_hour":0,
+                "daily_close_minute":0,
+                "mode":"next_cycle"
+            }
+        })
+        .to_string();
+
+        let parsed = parse_command_for_scope(
+            &raw,
+            &CommandScope {
+                tenant_id: "t1",
+                exchange: "bybit",
+                product_id: "SOL-USD",
+            },
+        )
+        .expect("parse ok");
+
+        match parsed {
+            Some(RuntimeCommand::UpdateDailyCloseSchedule {
+                local_timezone_iana,
+                daily_close_hour,
+                daily_close_minute,
+                mode,
+                ..
+            }) => {
+                assert_eq!(local_timezone_iana, "Asia/Singapore");
+                assert_eq!(daily_close_hour, 0);
+                assert_eq!(daily_close_minute, 0);
+                assert_eq!(mode, "next_cycle");
+            }
+            _ => panic!("expected update schedule command"),
+        }
+    }
+
+    #[test]
+    fn parse_schedule_command_flattened_payload() {
+        let raw = json!({
+            "type":"update_daily_close_schedule",
+            "tenant_id":"t1",
+            "exchange":"bybit",
+            "product_id":"all",
+            "local_timezone_iana":"Europe/Paris",
+            "daily_close_hour":"1",
+            "daily_close_minute":30,
+            "mode":"immediate"
+        })
+        .to_string();
+
+        let parsed = parse_command_for_scope(
+            &raw,
+            &CommandScope {
+                tenant_id: "t1",
+                exchange: "bybit",
+                product_id: "DOGE-USD",
+            },
+        )
+        .expect("parse ok");
+
+        match parsed {
+            Some(RuntimeCommand::UpdateDailyCloseSchedule {
+                product_id,
+                local_timezone_iana,
+                daily_close_hour,
+                daily_close_minute,
+                mode,
+                ..
+            }) => {
+                assert_eq!(product_id, "all");
+                assert_eq!(local_timezone_iana, "Europe/Paris");
+                assert_eq!(daily_close_hour, 1);
+                assert_eq!(daily_close_minute, 30);
+                assert_eq!(mode, "immediate");
+            }
+            _ => panic!("expected update schedule command"),
+        }
+    }
+
+    #[test]
+    fn parse_command_filters_mismatched_scope() {
+        let raw = json!({
+            "type":"skip_daily_close",
+            "tenant_id":"t2",
+            "exchange":"bybit",
+            "product_id":"SOL-USD"
+        })
+        .to_string();
+
+        let parsed = parse_command_for_scope(
+            &raw,
+            &CommandScope {
+                tenant_id: "t1",
+                exchange: "bybit",
+                product_id: "SOL-USD",
+            },
+        )
+        .expect("parse ok");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_schedule_command_rejects_invalid_time() {
+        let raw = json!({
+            "type":"update_daily_close_schedule",
+            "tenant_id":"t1",
+            "exchange":"bybit",
+            "product_id":"SOL-USD",
+            "local_timezone_iana":"Europe/Paris",
+            "daily_close_hour":99,
+            "daily_close_minute":0
+        })
+        .to_string();
+
+        let parsed = parse_command_for_scope(
+            &raw,
+            &CommandScope {
+                tenant_id: "t1",
+                exchange: "bybit",
+                product_id: "SOL-USD",
+            },
+        )
+        .expect("parse ok");
+        assert!(parsed.is_none());
     }
 }
