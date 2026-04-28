@@ -58,7 +58,7 @@ pub async fn run() -> Result<()> {
 
     let mut kernel = TradingKernel::new(config.clone())?;
     let mut execution: Box<dyn ExecutionProvider> = match mode.as_str() {
-        EXEC_MODE_LIVE => Box::new(BybitLiveExecutionProvider::default()),
+        EXEC_MODE_LIVE => Box::new(BybitLiveExecutionProvider::new_from_env()?),
         _ => Box::new(BybitSimulatorExecutionProvider::default()),
     };
     let mut publisher: Box<dyn StatePublisher> = Box::new(StdoutStatePublisher);
