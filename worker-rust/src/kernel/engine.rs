@@ -243,9 +243,10 @@ impl TradingKernel {
     }
 
     fn cancel_active_order_decisions(&self) -> Vec<KernelDecision> {
-        self.active_order_ids
-            .iter()
-            .cloned()
+        let mut order_ids: Vec<String> = self.active_order_ids.iter().cloned().collect();
+        order_ids.sort_unstable();
+        order_ids
+            .into_iter()
             .map(|order_id| KernelDecision::CancelOrder {
                 tenant_id: self.config.tenant_id.clone(),
                 exchange: self.config.exchange.clone(),
@@ -340,4 +341,91 @@ fn quote_to_base(level_size_quote: f64, price: f64) -> f64 {
         return 0.0;
     }
     level_size_quote / price
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strategy() -> StrategyConfig {
+        StrategyConfig {
+            tenant_id: "t1".to_string(),
+            exchange: "bybit".to_string(),
+            product_id: "SOL-USD".to_string(),
+            spacing_bps: 50.0,
+            rebalance_threshold_bps: 30.0,
+            grid_levels: 2,
+            level_size_quote: 10.0,
+            local_timezone_iana: "Europe/Paris".to_string(),
+            daily_close_hour: 0,
+            daily_close_minute: 0,
+        }
+    }
+
+    fn tick(mid: f64, ts: i64) -> MarketTick {
+        MarketTick {
+            tenant_id: "t1".to_string(),
+            exchange: "bybit".to_string(),
+            product_id: "SOL-USD".to_string(),
+            bid: mid - 0.01,
+            ask: mid + 0.01,
+            mid,
+            event_ts_ms: ts,
+        }
+    }
+
+    fn decision_signature(decision: &KernelDecision) -> String {
+        match decision {
+            KernelDecision::PlaceOrder(o) => format!(
+                "place:{}:{:.8}:{:.8}:{}",
+                o.side, o.price, o.size_base, o.post_only
+            ),
+            KernelDecision::CancelOrder { order_id, .. } => format!("cancel:{order_id}"),
+            KernelDecision::LiquidateInventory { reason, .. } => format!("liquidate:{reason}"),
+            KernelDecision::Noop => "noop".to_string(),
+        }
+    }
+
+    #[test]
+    fn cancel_decisions_are_deterministically_sorted() {
+        let mut kernel = TradingKernel::new(strategy()).expect("kernel");
+        kernel.register_open_order("order-3".to_string());
+        kernel.register_open_order("order-1".to_string());
+        kernel.register_open_order("order-2".to_string());
+
+        let _ = kernel.on_tick(&tick(100.0, 1)).expect("bootstrap");
+        let output = kernel.on_tick(&tick(101.0, 2)).expect("rebalance");
+
+        let cancels: Vec<String> = output
+            .decisions
+            .iter()
+            .filter_map(|d| match d {
+                KernelDecision::CancelOrder { order_id, .. } => Some(order_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(cancels, vec!["order-1", "order-2", "order-3"]);
+    }
+
+    #[test]
+    fn identical_stream_produces_identical_decisions() {
+        let mut a = TradingKernel::new(strategy()).expect("kernel A");
+        let mut b = TradingKernel::new(strategy()).expect("kernel B");
+
+        a.register_open_order("alpha".to_string());
+        a.register_open_order("beta".to_string());
+        b.register_open_order("alpha".to_string());
+        b.register_open_order("beta".to_string());
+
+        let ticks = vec![tick(100.0, 1), tick(100.05, 2), tick(100.45, 3)];
+        for t in ticks {
+            let out_a = a.on_tick(&t).expect("A tick");
+            let out_b = b.on_tick(&t).expect("B tick");
+            let sig_a: Vec<String> = out_a.decisions.iter().map(decision_signature).collect();
+            let sig_b: Vec<String> = out_b.decisions.iter().map(decision_signature).collect();
+            assert_eq!(sig_a, sig_b);
+            assert_eq!(out_a.events.len(), out_b.events.len());
+        }
+    }
 }
