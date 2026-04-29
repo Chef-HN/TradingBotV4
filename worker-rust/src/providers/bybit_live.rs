@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -36,6 +36,16 @@ const ENDPOINT_ORDER_CANCEL: &str = "/v5/order/cancel";
 const ENDPOINT_ORDER_CANCEL_ALL: &str = "/v5/order/cancel-all";
 const ENDPOINT_EXECUTION_LIST: &str = "/v5/execution/list";
 const ENDPOINT_WALLET_BALANCE: &str = "/v5/account/wallet-balance";
+const ENDPOINT_INSTRUMENTS_INFO: &str = "/v5/market/instruments-info";
+
+#[derive(Debug, Clone)]
+struct BybitInstrumentRules {
+    tick_size: f64,
+    qty_step: f64,
+    min_order_qty: Option<f64>,
+    max_order_qty: Option<f64>,
+    min_order_notional: Option<f64>,
+}
 
 pub struct BybitLiveExecutionProvider {
     api_key: String,
@@ -47,6 +57,7 @@ pub struct BybitLiveExecutionProvider {
     seq: AtomicU64,
     seen_exec_ids: HashSet<String>,
     last_exec_time_ms: i64,
+    rules_by_symbol: HashMap<String, BybitInstrumentRules>,
 }
 
 impl BybitLiveExecutionProvider {
@@ -80,6 +91,7 @@ impl BybitLiveExecutionProvider {
             seq: AtomicU64::new(0),
             seen_exec_ids: HashSet::new(),
             last_exec_time_ms: now_ms() - 10 * 60 * 1000,
+            rules_by_symbol: HashMap::new(),
         })
     }
 
@@ -263,6 +275,139 @@ impl BybitLiveExecutionProvider {
 
         Ok(0.0)
     }
+
+    async fn get_instrument_rules(&mut self, symbol: &str) -> Result<BybitInstrumentRules> {
+        if let Some(rules) = self.rules_by_symbol.get(symbol) {
+            return Ok(rules.clone());
+        }
+
+        let params = vec![
+            ("category".to_string(), self.category.clone()),
+            ("symbol".to_string(), symbol.to_string()),
+        ];
+        let (result, _) = self
+            .signed_get_result(ENDPOINT_INSTRUMENTS_INFO, &params)
+            .await?;
+        let list = result
+            .get("list")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("instruments-info response missing result.list[]"))?;
+
+        let item = list
+            .iter()
+            .find(|x| {
+                x.get("symbol")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.eq_ignore_ascii_case(symbol))
+                    .unwrap_or(false)
+            })
+            .or_else(|| list.first())
+            .ok_or_else(|| anyhow!("instruments-info returned empty list for symbol {symbol}"))?;
+
+        let rules = parse_instrument_rules(item)?;
+        self.rules_by_symbol
+            .insert(symbol.to_string(), rules.clone());
+        Ok(rules)
+    }
+
+    fn normalize_limit_order(
+        &self,
+        side: &str,
+        request_qty: f64,
+        request_price: f64,
+        rules: &BybitInstrumentRules,
+    ) -> Result<(f64, f64)> {
+        if request_qty <= 0.0 || request_price <= 0.0 {
+            return Err(anyhow!(
+                "order qty/price must be > 0, got qty={} price={}",
+                request_qty,
+                request_price
+            ));
+        }
+
+        let qty = floor_to_step(request_qty, rules.qty_step);
+        if qty <= 0.0 {
+            return Err(anyhow!(
+                "order qty {} rounded to zero with qty_step {}",
+                request_qty,
+                rules.qty_step
+            ));
+        }
+
+        let price = if side.eq_ignore_ascii_case("Buy") {
+            floor_to_step(request_price, rules.tick_size)
+        } else {
+            ceil_to_step(request_price, rules.tick_size)
+        };
+        if price <= 0.0 {
+            return Err(anyhow!(
+                "order price {} rounded to zero with tick_size {}",
+                request_price,
+                rules.tick_size
+            ));
+        }
+
+        if let Some(min_qty) = rules.min_order_qty {
+            if qty + 1e-12 < min_qty {
+                return Err(anyhow!(
+                    "order qty {} is below min_order_qty {} after quantization",
+                    qty,
+                    min_qty
+                ));
+            }
+        }
+
+        if let Some(max_qty) = rules.max_order_qty {
+            if qty - 1e-12 > max_qty {
+                return Err(anyhow!(
+                    "order qty {} exceeds max_order_qty {} after quantization",
+                    qty,
+                    max_qty
+                ));
+            }
+        }
+
+        if let Some(min_notional) = rules.min_order_notional {
+            let notional = qty * price;
+            if notional + 1e-12 < min_notional {
+                return Err(anyhow!(
+                    "order notional {} is below min_order_notional {} after quantization",
+                    notional,
+                    min_notional
+                ));
+            }
+        }
+
+        Ok((qty, price))
+    }
+
+    fn normalize_market_sell_qty(
+        &self,
+        request_qty: f64,
+        rules: &BybitInstrumentRules,
+    ) -> Result<f64> {
+        if request_qty <= 0.0 {
+            return Ok(0.0);
+        }
+        let qty = floor_to_step(request_qty, rules.qty_step);
+        if qty <= 0.0 {
+            return Ok(0.0);
+        }
+
+        if let Some(min_qty) = rules.min_order_qty {
+            if qty + 1e-12 < min_qty {
+                return Ok(0.0);
+            }
+        }
+
+        if let Some(max_qty) = rules.max_order_qty {
+            if qty - 1e-12 > max_qty {
+                return Ok(floor_to_step(max_qty, rules.qty_step));
+            }
+        }
+
+        Ok(qty)
+    }
 }
 
 #[async_trait]
@@ -270,6 +415,9 @@ impl ExecutionProvider for BybitLiveExecutionProvider {
     async fn submit(&mut self, request: &OrderRequest) -> Result<String> {
         let symbol = product_id_to_bybit_symbol(&request.product_id);
         let side = normalize_order_side(&request.side)?;
+        let rules = self.get_instrument_rules(&symbol).await?;
+        let (qty, price) =
+            self.normalize_limit_order(side, request.size_base, request.price, &rules)?;
         let order_link_id = self.next_order_link_id(&request.product_id, &request.side);
 
         let body = json!({
@@ -277,8 +425,8 @@ impl ExecutionProvider for BybitLiveExecutionProvider {
             "symbol": symbol,
             "side": side,
             "orderType": "Limit",
-            "qty": format_decimal(request.size_base),
-            "price": format_decimal(request.price),
+            "qty": format_decimal(qty),
+            "price": format_decimal(price),
             "timeInForce": if request.post_only { "PostOnly" } else { "GTC" },
             "orderLinkId": order_link_id,
         });
@@ -364,6 +512,7 @@ impl ExecutionProvider for BybitLiveExecutionProvider {
     ) -> Result<()> {
         let symbol = product_id_to_bybit_symbol(product_id);
         let base_coin = base_coin_from_product_id(product_id)?;
+        let rules = self.get_instrument_rules(&symbol).await?;
 
         let cancel_all_body = json!({
             "category": self.category,
@@ -377,13 +526,17 @@ impl ExecutionProvider for BybitLiveExecutionProvider {
         if base_balance <= MIN_LIQUIDATION_BASE_QTY {
             return Ok(());
         }
+        let sell_qty = self.normalize_market_sell_qty(base_balance, &rules)?;
+        if sell_qty <= MIN_LIQUIDATION_BASE_QTY {
+            return Ok(());
+        }
 
         let sell_body = json!({
             "category": self.category,
             "symbol": symbol,
             "side": "Sell",
             "orderType": "Market",
-            "qty": format_decimal(base_balance),
+            "qty": format_decimal(sell_qty),
             "marketUnit": "baseCoin",
             "orderLinkId": self.next_order_link_id(product_id, "sell"),
         });
@@ -560,6 +713,75 @@ fn parse_i64_opt(value: Option<&Value>) -> Option<i64> {
     }
 }
 
+fn parse_instrument_rules(item: &Value) -> Result<BybitInstrumentRules> {
+    let tick_size = parse_nested_number_required(
+        item,
+        &[("priceFilter", "tickSize"), ("priceFilter", "priceTick")],
+        "priceFilter.tickSize",
+    )?;
+
+    let qty_step = parse_nested_number_optional(item, &[("lotSizeFilter", "qtyStep")])
+        .or_else(|| parse_nested_number_optional(item, &[("lotSizeFilter", "basePrecision")]))
+        .filter(|v| *v > 0.0)
+        .ok_or_else(|| anyhow!("instrument rules missing lotSizeFilter.qtyStep/basePrecision"))?;
+
+    let min_order_qty = parse_nested_number_optional(item, &[("lotSizeFilter", "minOrderQty")]);
+    let max_order_qty = parse_nested_number_optional(item, &[("lotSizeFilter", "maxOrderQty")]);
+    let min_order_notional =
+        parse_nested_number_optional(item, &[("lotSizeFilter", "minOrderAmt")]);
+
+    Ok(BybitInstrumentRules {
+        tick_size,
+        qty_step,
+        min_order_qty,
+        max_order_qty,
+        min_order_notional,
+    })
+}
+
+fn parse_nested_number_required(
+    root: &Value,
+    candidates: &[(&str, &str)],
+    label: &str,
+) -> Result<f64> {
+    let value = parse_nested_number_optional(root, candidates)
+        .ok_or_else(|| anyhow!("missing required instrument field '{label}'"))?;
+    if value <= 0.0 {
+        return Err(anyhow!(
+            "instrument field '{label}' must be > 0, got {value}"
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_nested_number_optional(root: &Value, candidates: &[(&str, &str)]) -> Option<f64> {
+    for (outer, inner) in candidates {
+        let Some(v) = root.get(*outer).and_then(|x| x.get(*inner)) else {
+            continue;
+        };
+        if let Some(parsed) = parse_number_str_opt(Some(v)) {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn floor_to_step(value: f64, step: f64) -> f64 {
+    if step <= 0.0 {
+        return value;
+    }
+    let units = (value / step).floor();
+    (units * step).max(0.0)
+}
+
+fn ceil_to_step(value: f64, step: f64) -> f64 {
+    if step <= 0.0 {
+        return value;
+    }
+    let units = (value / step).ceil();
+    (units * step).max(0.0)
+}
+
 fn format_decimal(value: f64) -> String {
     let mut s = format!("{value:.12}");
     while s.contains('.') && s.ends_with('0') {
@@ -586,7 +808,92 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use super::*;
+
+    #[test]
+    fn parses_instrument_rules_from_spot_shape() {
+        let item = json!({
+            "symbol":"SOLUSDT",
+            "priceFilter": {"tickSize":"0.01"},
+            "lotSizeFilter": {
+                "basePrecision":"0.001",
+                "minOrderQty":"0.01",
+                "maxOrderQty":"500",
+                "minOrderAmt":"1"
+            }
+        });
+
+        let rules = parse_instrument_rules(&item).expect("rules");
+        assert!((rules.tick_size - 0.01).abs() < 1e-12);
+        assert!((rules.qty_step - 0.001).abs() < 1e-12);
+        assert!((rules.min_order_qty.expect("min qty") - 0.01).abs() < 1e-12);
+        assert!((rules.max_order_qty.expect("max qty") - 500.0).abs() < 1e-12);
+        assert!((rules.min_order_notional.expect("min amt") - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rounds_limit_order_by_side() {
+        let provider = BybitLiveExecutionProvider {
+            api_key: String::new(),
+            api_secret: String::new(),
+            base_url: String::new(),
+            category: "spot".to_string(),
+            recv_window_ms: 5_000,
+            client: reqwest::Client::new(),
+            seq: AtomicU64::new(0),
+            seen_exec_ids: HashSet::new(),
+            last_exec_time_ms: 0,
+            rules_by_symbol: HashMap::new(),
+        };
+        let rules = BybitInstrumentRules {
+            tick_size: 0.01,
+            qty_step: 0.001,
+            min_order_qty: Some(0.01),
+            max_order_qty: Some(1000.0),
+            min_order_notional: Some(1.0),
+        };
+
+        let (buy_qty, buy_price) = provider
+            .normalize_limit_order("Buy", 1.23456, 100.127, &rules)
+            .expect("buy");
+        let (sell_qty, sell_price) = provider
+            .normalize_limit_order("Sell", 1.23456, 100.127, &rules)
+            .expect("sell");
+
+        assert!((buy_qty - 1.234).abs() < 1e-9);
+        assert!((sell_qty - 1.234).abs() < 1e-9);
+        assert!((buy_price - 100.12).abs() < 1e-9);
+        assert!((sell_price - 100.13).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_limit_order_below_min_notional() {
+        let provider = BybitLiveExecutionProvider {
+            api_key: String::new(),
+            api_secret: String::new(),
+            base_url: String::new(),
+            category: "spot".to_string(),
+            recv_window_ms: 5_000,
+            client: reqwest::Client::new(),
+            seq: AtomicU64::new(0),
+            seen_exec_ids: HashSet::new(),
+            last_exec_time_ms: 0,
+            rules_by_symbol: HashMap::new(),
+        };
+        let rules = BybitInstrumentRules {
+            tick_size: 0.01,
+            qty_step: 0.001,
+            min_order_qty: Some(0.001),
+            max_order_qty: None,
+            min_order_notional: Some(10.0),
+        };
+        let err = provider
+            .normalize_limit_order("Buy", 0.05, 100.0, &rules)
+            .expect_err("must reject");
+        assert!(err.to_string().contains("min_order_notional"));
+    }
 
     #[test]
     fn hmac_signature_is_stable_for_known_vector() {
