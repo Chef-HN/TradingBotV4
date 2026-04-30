@@ -55,6 +55,9 @@ pub async fn run() -> Result<()> {
     let allow_reset_command = read_env_bool(ENV_ALLOW_RESET_COMMAND, false);
     let (market_data_provider_name, mut market_data) =
         build_market_data_provider(&config, &mode, tick_interval_ms)?;
+    let replay_mode = market_data_provider_name.eq_ignore_ascii_case(MARKET_DATA_REPLAY)
+        || market_data_provider_name.eq_ignore_ascii_case("replay_json")
+        || market_data_provider_name.eq_ignore_ascii_case("replay_jsonl");
 
     let mut kernel = TradingKernel::new(config.clone())?;
     let mut execution: Box<dyn ExecutionProvider> = match mode.as_str() {
@@ -98,7 +101,7 @@ pub async fn run() -> Result<()> {
             "exchange": config.exchange,
             "product_id": config.product_id,
             "execution_mode": mode,
-            "market_data_provider": market_data_provider_name,
+            "market_data_provider": market_data_provider_name.as_str(),
             "session_timezone_iana": scheduler.session_timezone_iana(),
             "next_close_utc": scheduler.next_close_utc().to_rfc3339(),
         })
@@ -158,7 +161,28 @@ pub async fn run() -> Result<()> {
                     publisher.publish(&reset_applied).await?;
                 }
 
-                let tick = tick?;
+                let tick = match tick {
+                    Ok(t) => t,
+                    Err(err) => {
+                        if replay_mode && err.to_string().contains("replay stream exhausted") {
+                            let replay_done = WorkerStateEvent {
+                                tenant_id: config.tenant_id.clone(),
+                                exchange: config.exchange.clone(),
+                                product_id: config.product_id.clone(),
+                                state_type: "replay_completed".to_string(),
+                                payload: json!({
+                                    "market_data_provider": market_data_provider_name.as_str(),
+                                    "session_id": session_id,
+                                    "total_fills": total_fills,
+                                }),
+                                emitted_at_ts_ms: now_ms(),
+                            };
+                            publisher.publish(&replay_done).await?;
+                            break;
+                        }
+                        return Err(err);
+                    }
+                };
                 execution.on_market_tick(&tick).await?;
 
                 let output = kernel.on_tick(&tick)?;
