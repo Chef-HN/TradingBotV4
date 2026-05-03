@@ -13,6 +13,12 @@ pub use bybit_market_data::BybitRestMarketDataProvider;
 pub use bybit_simulator::BybitSimulatorExecutionProvider;
 pub use market_data::{ReplayMarketDataProvider, SyntheticMarketDataProvider};
 
+#[derive(Debug, Clone)]
+pub struct ExecutionReconciliationSnapshot {
+    pub provider_name: String,
+    pub open_order_count: usize,
+}
+
 #[async_trait]
 pub trait MarketDataProvider: Send {
     async fn next_tick(&mut self) -> Result<MarketTick>;
@@ -41,4 +47,10 @@ pub trait ExecutionProvider: Send {
         exchange: &str,
         product_id: &str,
     ) -> Result<()>;
+    async fn reconciliation_snapshot(
+        &mut self,
+        tenant_id: &str,
+        exchange: &str,
+        product_id: &str,
+    ) -> Result<ExecutionReconciliationSnapshot>;
 }

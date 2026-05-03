@@ -197,6 +197,27 @@ pub async fn run() -> Result<()> {
                     total_fills += 1;
                 }
 
+                let reconciliation = execution
+                    .reconciliation_snapshot(&tick.tenant_id, &tick.exchange, &tick.product_id)
+                    .await?;
+                let kernel_open_order_count = kernel.active_order_count();
+                if reconciliation.open_order_count != kernel_open_order_count {
+                    let mismatch_event = WorkerStateEvent {
+                        tenant_id: tick.tenant_id.clone(),
+                        exchange: tick.exchange.clone(),
+                        product_id: tick.product_id.clone(),
+                        state_type: "execution_reconciliation_mismatch".to_string(),
+                        payload: json!({
+                            "provider": reconciliation.provider_name,
+                            "provider_open_order_count": reconciliation.open_order_count,
+                            "kernel_open_order_count": kernel_open_order_count,
+                            "total_fills": total_fills,
+                        }),
+                        emitted_at_ts_ms: now_ms(),
+                    };
+                    publisher.publish(&mismatch_event).await?;
+                }
+
                 let now_utc = Utc::now();
                 if scheduler.should_trigger(now_utc) {
                     if skip_next_daily_close {

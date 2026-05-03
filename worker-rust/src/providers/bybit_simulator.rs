@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use crate::kernel::types::{FillEvent, MarketTick, OrderRequest};
 
-use super::ExecutionProvider;
+use super::{ExecutionProvider, ExecutionReconciliationSnapshot};
 
 #[derive(Debug, Clone)]
 struct StoredOrder {
@@ -122,6 +122,27 @@ impl ExecutionProvider for BybitSimulatorExecutionProvider {
         });
         Ok(())
     }
+
+    async fn reconciliation_snapshot(
+        &mut self,
+        tenant_id: &str,
+        exchange: &str,
+        product_id: &str,
+    ) -> Result<ExecutionReconciliationSnapshot> {
+        let open_order_count = self
+            .open_orders
+            .values()
+            .filter(|stored| {
+                stored.request.tenant_id == tenant_id
+                    && stored.request.exchange == exchange
+                    && stored.request.product_id == product_id
+            })
+            .count();
+        Ok(ExecutionReconciliationSnapshot {
+            provider_name: "bybit_simulator".to_string(),
+            open_order_count,
+        })
+    }
 }
 
 fn should_cross(side: &str, order_price: f64, tick: &MarketTick) -> bool {
@@ -129,5 +150,93 @@ fn should_cross(side: &str, order_price: f64, tick: &MarketTick) -> bool {
         "buy" => tick.ask <= order_price,
         "sell" => tick.bid >= order_price,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_order(side: &str, price: f64, product_id: &str) -> OrderRequest {
+        OrderRequest {
+            tenant_id: "tenant-a".to_string(),
+            exchange: "bybit".to_string(),
+            product_id: product_id.to_string(),
+            side: side.to_string(),
+            price,
+            size_base: 1.0,
+            post_only: true,
+        }
+    }
+
+    fn sample_tick(mid: f64) -> MarketTick {
+        MarketTick {
+            tenant_id: "tenant-a".to_string(),
+            exchange: "bybit".to_string(),
+            product_id: "SOL-USD".to_string(),
+            bid: mid - 0.01,
+            ask: mid + 0.01,
+            mid,
+            event_ts_ms: 1_711_111_111_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_snapshot_counts_open_orders_for_scope() {
+        let mut provider = BybitSimulatorExecutionProvider::default();
+        provider
+            .submit(&sample_order("buy", 100.0, "SOL-USD"))
+            .await
+            .expect("submit 1");
+        provider
+            .submit(&sample_order("sell", 101.0, "SOL-USD"))
+            .await
+            .expect("submit 2");
+        provider
+            .submit(&sample_order("buy", 10.0, "DOGE-USD"))
+            .await
+            .expect("submit other symbol");
+
+        let snap = provider
+            .reconciliation_snapshot("tenant-a", "bybit", "SOL-USD")
+            .await
+            .expect("snapshot");
+        assert_eq!(snap.provider_name, "bybit_simulator");
+        assert_eq!(snap.open_order_count, 2);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_snapshot_tracks_fills_and_cancels() {
+        let mut provider = BybitSimulatorExecutionProvider::default();
+        let buy_order_id = provider
+            .submit(&sample_order("buy", 100.0, "SOL-USD"))
+            .await
+            .expect("submit buy");
+        let sell_order_id = provider
+            .submit(&sample_order("sell", 101.0, "SOL-USD"))
+            .await
+            .expect("submit sell");
+
+        provider
+            .cancel("tenant-a", "bybit", "SOL-USD", &sell_order_id)
+            .await
+            .expect("cancel sell");
+
+        provider
+            .on_market_tick(&sample_tick(99.99))
+            .await
+            .expect("on tick");
+        let fills = provider
+            .flush_fills("tenant-a", "bybit", "SOL-USD")
+            .await
+            .expect("flush");
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].order_id, buy_order_id);
+
+        let snap = provider
+            .reconciliation_snapshot("tenant-a", "bybit", "SOL-USD")
+            .await
+            .expect("snapshot");
+        assert_eq!(snap.open_order_count, 0);
     }
 }

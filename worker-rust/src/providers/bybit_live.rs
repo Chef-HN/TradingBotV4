@@ -14,7 +14,7 @@ use sha2::Sha256;
 
 use crate::kernel::types::{FillEvent, MarketTick, OrderRequest};
 
-use super::ExecutionProvider;
+use super::{ExecutionProvider, ExecutionReconciliationSnapshot};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -56,6 +56,7 @@ pub struct BybitLiveExecutionProvider {
     client: reqwest::Client,
     seq: AtomicU64,
     seen_exec_ids: HashSet<String>,
+    local_open_order_ids: HashSet<String>,
     last_exec_time_ms: i64,
     rules_by_symbol: HashMap<String, BybitInstrumentRules>,
 }
@@ -90,6 +91,7 @@ impl BybitLiveExecutionProvider {
             client,
             seq: AtomicU64::new(0),
             seen_exec_ids: HashSet::new(),
+            local_open_order_ids: HashSet::new(),
             last_exec_time_ms: now_ms() - 10 * 60 * 1000,
             rules_by_symbol: HashMap::new(),
         })
@@ -229,6 +231,9 @@ impl BybitLiveExecutionProvider {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        if !order_id.trim().is_empty() {
+            self.local_open_order_ids.remove(&order_id);
+        }
 
         Ok(Some(FillEvent {
             tenant_id: tenant_id.to_string(),
@@ -439,6 +444,7 @@ impl ExecutionProvider for BybitLiveExecutionProvider {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("Bybit order/create missing result.orderId"))?
             .to_string();
+        self.local_open_order_ids.insert(order_id.clone());
 
         Ok(order_id)
     }
@@ -460,6 +466,7 @@ impl ExecutionProvider for BybitLiveExecutionProvider {
         let _ = self
             .signed_post_result(ENDPOINT_ORDER_CANCEL, &body)
             .await?;
+        self.local_open_order_ids.remove(order_id);
         Ok(())
     }
 
@@ -521,6 +528,7 @@ impl ExecutionProvider for BybitLiveExecutionProvider {
         let _ = self
             .signed_post_result(ENDPOINT_ORDER_CANCEL_ALL, &cancel_all_body)
             .await?;
+        self.local_open_order_ids.clear();
 
         let base_balance = self.fetch_base_balance(&base_coin).await?;
         if base_balance <= MIN_LIQUIDATION_BASE_QTY {
@@ -545,6 +553,18 @@ impl ExecutionProvider for BybitLiveExecutionProvider {
             .signed_post_result(ENDPOINT_ORDER_CREATE, &sell_body)
             .await?;
         Ok(())
+    }
+
+    async fn reconciliation_snapshot(
+        &mut self,
+        _tenant_id: &str,
+        _exchange: &str,
+        _product_id: &str,
+    ) -> Result<ExecutionReconciliationSnapshot> {
+        Ok(ExecutionReconciliationSnapshot {
+            provider_name: "bybit_live".to_string(),
+            open_order_count: self.local_open_order_ids.len(),
+        })
     }
 }
 
@@ -844,6 +864,7 @@ mod tests {
             client: reqwest::Client::new(),
             seq: AtomicU64::new(0),
             seen_exec_ids: HashSet::new(),
+            local_open_order_ids: HashSet::new(),
             last_exec_time_ms: 0,
             rules_by_symbol: HashMap::new(),
         };
@@ -879,6 +900,7 @@ mod tests {
             client: reqwest::Client::new(),
             seq: AtomicU64::new(0),
             seen_exec_ids: HashSet::new(),
+            local_open_order_ids: HashSet::new(),
             last_exec_time_ms: 0,
             rules_by_symbol: HashMap::new(),
         };
@@ -930,5 +952,33 @@ mod tests {
         assert_eq!(normalize_fill_side("Buy").expect("buy"), "buy");
         assert_eq!(normalize_fill_side("sell").expect("sell"), "sell");
         assert!(normalize_fill_side("hold").is_err());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_snapshot_reflects_local_open_orders() {
+        let mut provider = BybitLiveExecutionProvider {
+            api_key: String::new(),
+            api_secret: String::new(),
+            base_url: String::new(),
+            category: "spot".to_string(),
+            recv_window_ms: 5_000,
+            client: reqwest::Client::new(),
+            seq: AtomicU64::new(0),
+            seen_exec_ids: HashSet::new(),
+            local_open_order_ids: HashSet::from([
+                "oid-1".to_string(),
+                "oid-2".to_string(),
+                "oid-3".to_string(),
+            ]),
+            last_exec_time_ms: 0,
+            rules_by_symbol: HashMap::new(),
+        };
+
+        let snap = provider
+            .reconciliation_snapshot("t1", "bybit", "SOL-USD")
+            .await
+            .expect("snapshot");
+        assert_eq!(snap.provider_name, "bybit_live");
+        assert_eq!(snap.open_order_count, 3);
     }
 }
