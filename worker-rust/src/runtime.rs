@@ -30,10 +30,46 @@ const MARKET_DATA_BYBIT_REST: &str = "bybit_rest";
 const SCHEDULE_MODE_IMMEDIATE: &str = "immediate";
 const SCHEDULE_MODE_NEXT_CYCLE: &str = "next_cycle";
 const ENV_ALLOW_RESET_COMMAND: &str = "TB_ALLOW_RESET_COMMAND";
+const ENV_MARKET_DATA_GAP_WARN_MS: &str = "TB_MARKET_DATA_GAP_WARN_MS";
 
 #[derive(Debug, Default)]
 struct RuntimeCommandEffects {
     reset_kernel: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+struct KernelOutputStats {
+    orders_submitted: i64,
+    orders_canceled: i64,
+    liquidations_requested: i64,
+    events_published: i64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RuntimeObservability {
+    ticks_processed: i64,
+    commands_processed: i64,
+    last_command_batch_size: i64,
+    max_command_batch_size: i64,
+    orders_submitted: i64,
+    orders_canceled: i64,
+    liquidations_requested: i64,
+    fills_processed: i64,
+    kernel_events_published: i64,
+    reconciliation_mismatches: i64,
+    market_data_gap_events: i64,
+    last_tick_gap_ms: Option<i64>,
+    max_tick_gap_ms: i64,
+    last_cycle_correlation_id: Option<String>,
+}
+
+impl RuntimeObservability {
+    fn apply_kernel_output_stats(&mut self, stats: &KernelOutputStats) {
+        self.orders_submitted += stats.orders_submitted;
+        self.orders_canceled += stats.orders_canceled;
+        self.liquidations_requested += stats.liquidations_requested;
+        self.kernel_events_published += stats.events_published;
+    }
 }
 
 pub async fn run() -> Result<()> {
@@ -83,6 +119,12 @@ pub async fn run() -> Result<()> {
     let session_id = format!("rust-{}", Uuid::new_v4());
     let mut total_fills: i64 = 0;
     let mut last_tick: Option<MarketTick> = None;
+    let mut cycle_seq: u64 = 0;
+    let mut last_tick_event_ts_ms: Option<i64> = None;
+    let mut observability = RuntimeObservability::default();
+    let default_gap_warn_ms = ((tick_interval_ms as i64) * 3).max(5_000);
+    let market_data_gap_warn_ms =
+        read_env_i64(ENV_MARKET_DATA_GAP_WARN_MS, default_gap_warn_ms).max(250);
 
     let mut control_plane = RedisControlPlane::connect(
         &sources.redis_url,
@@ -120,6 +162,8 @@ pub async fn run() -> Result<()> {
         total_fills,
         &kernel,
         last_tick.as_ref(),
+        &observability,
+        market_data_gap_warn_ms,
     )
     .await?;
     control_plane.publish_heartbeat().await?;
@@ -134,15 +178,25 @@ pub async fn run() -> Result<()> {
                 break;
             }
             tick = market_data.next_tick() => {
+                cycle_seq = cycle_seq.saturating_add(1);
+                let correlation_id = format!("cycle:{}:{cycle_seq}", session_id);
+                observability.last_cycle_correlation_id = Some(correlation_id.clone());
                 let now_utc = Utc::now();
+                let commands = control_plane.pop_commands().await?;
+                let command_batch_size = commands.len() as i64;
+                observability.commands_processed += command_batch_size;
+                observability.last_command_batch_size = command_batch_size;
+                observability.max_command_batch_size =
+                    observability.max_command_batch_size.max(command_batch_size);
                 let command_effects = apply_runtime_commands(
-                    control_plane.pop_commands().await?,
+                    commands,
                     &config,
                     &mut scheduler,
                     &mut skip_next_daily_close,
                     allow_reset_command,
                     &mut *publisher,
                     now_utc,
+                    &correlation_id,
                 ).await?;
 
                 if command_effects.reset_kernel {
@@ -155,7 +209,10 @@ pub async fn run() -> Result<()> {
                         exchange: config.exchange.clone(),
                         product_id: config.product_id.clone(),
                         state_type: "kernel_reset_applied".to_string(),
-                        payload: json!({"source":"redis_command"}),
+                        payload: with_correlation_payload(
+                            json!({"source":"redis_command"}),
+                            &correlation_id,
+                        ),
                         emitted_at_ts_ms: now_ms(),
                     };
                     publisher.publish(&reset_applied).await?;
@@ -170,11 +227,14 @@ pub async fn run() -> Result<()> {
                                 exchange: config.exchange.clone(),
                                 product_id: config.product_id.clone(),
                                 state_type: "replay_completed".to_string(),
-                                payload: json!({
-                                    "market_data_provider": market_data_provider_name.as_str(),
-                                    "session_id": session_id,
-                                    "total_fills": total_fills,
-                                }),
+                                payload: with_correlation_payload(
+                                    json!({
+                                        "market_data_provider": market_data_provider_name.as_str(),
+                                        "session_id": session_id,
+                                        "total_fills": total_fills,
+                                    }),
+                                    &correlation_id,
+                                ),
                                 emitted_at_ts_ms: now_ms(),
                             };
                             publisher.publish(&replay_done).await?;
@@ -183,18 +243,63 @@ pub async fn run() -> Result<()> {
                         return Err(err);
                     }
                 };
+
+                observability.ticks_processed += 1;
+                if let Some(gap_ms) = compute_tick_gap_ms(last_tick_event_ts_ms, tick.event_ts_ms) {
+                    observability.last_tick_gap_ms = Some(gap_ms);
+                    observability.max_tick_gap_ms = observability.max_tick_gap_ms.max(gap_ms);
+                    if is_market_data_gap(gap_ms, market_data_gap_warn_ms) {
+                        observability.market_data_gap_events += 1;
+                        let gap_event = WorkerStateEvent {
+                            tenant_id: tick.tenant_id.clone(),
+                            exchange: tick.exchange.clone(),
+                            product_id: tick.product_id.clone(),
+                            state_type: "market_data_gap_detected".to_string(),
+                            payload: with_correlation_payload(
+                                json!({
+                                    "market_data_provider": market_data_provider_name.as_str(),
+                                    "gap_ms": gap_ms,
+                                    "threshold_ms": market_data_gap_warn_ms,
+                                    "previous_tick_ts_ms": last_tick_event_ts_ms,
+                                    "current_tick_ts_ms": tick.event_ts_ms,
+                                }),
+                                &correlation_id,
+                            ),
+                            emitted_at_ts_ms: now_ms(),
+                        };
+                        publisher.publish(&gap_event).await?;
+                    }
+                }
+                last_tick_event_ts_ms = Some(tick.event_ts_ms);
                 execution.on_market_tick(&tick).await?;
 
                 let output = kernel.on_tick(&tick)?;
-                process_kernel_output(output, &mut *execution, &mut *publisher, &mut kernel).await?;
+                let output_stats = process_kernel_output(
+                    output,
+                    &mut *execution,
+                    &mut *publisher,
+                    &mut kernel,
+                    &correlation_id,
+                )
+                .await?;
+                observability.apply_kernel_output_stats(&output_stats);
 
                 let fills = execution
                     .flush_fills(&tick.tenant_id, &tick.exchange, &tick.product_id)
                     .await?;
                 for fill in fills {
                     let out = kernel.on_fill(&fill);
-                    process_kernel_output(out, &mut *execution, &mut *publisher, &mut kernel).await?;
+                    let fill_stats = process_kernel_output(
+                        out,
+                        &mut *execution,
+                        &mut *publisher,
+                        &mut kernel,
+                        &correlation_id,
+                    )
+                    .await?;
+                    observability.apply_kernel_output_stats(&fill_stats);
                     total_fills += 1;
+                    observability.fills_processed += 1;
                 }
 
                 let reconciliation = execution
@@ -202,17 +307,21 @@ pub async fn run() -> Result<()> {
                     .await?;
                 let kernel_open_order_count = kernel.active_order_count();
                 if reconciliation.open_order_count != kernel_open_order_count {
+                    observability.reconciliation_mismatches += 1;
                     let mismatch_event = WorkerStateEvent {
                         tenant_id: tick.tenant_id.clone(),
                         exchange: tick.exchange.clone(),
                         product_id: tick.product_id.clone(),
                         state_type: "execution_reconciliation_mismatch".to_string(),
-                        payload: json!({
-                            "provider": reconciliation.provider_name,
-                            "provider_open_order_count": reconciliation.open_order_count,
-                            "kernel_open_order_count": kernel_open_order_count,
-                            "total_fills": total_fills,
-                        }),
+                        payload: with_correlation_payload(
+                            json!({
+                                "provider": reconciliation.provider_name,
+                                "provider_open_order_count": reconciliation.open_order_count,
+                                "kernel_open_order_count": kernel_open_order_count,
+                                "total_fills": total_fills,
+                            }),
+                            &correlation_id,
+                        ),
                         emitted_at_ts_ms: now_ms(),
                     };
                     publisher.publish(&mismatch_event).await?;
@@ -227,7 +336,10 @@ pub async fn run() -> Result<()> {
                             exchange: tick.exchange.clone(),
                             product_id: tick.product_id.clone(),
                             state_type: "daily_close_skipped".to_string(),
-                            payload: json!({"reason":"command_skip_daily_close"}),
+                            payload: with_correlation_payload(
+                                json!({"reason":"command_skip_daily_close"}),
+                                &correlation_id,
+                            ),
                             emitted_at_ts_ms: now_ms(),
                         };
                         publisher.publish(&skip_event).await?;
@@ -245,15 +357,25 @@ pub async fn run() -> Result<()> {
 
                         let (outcome, close_out) = kernel.on_daily_close(&close_input, daily_close_event_ts);
                         reserve_usd = outcome.resulting_reserve_usd;
-                        process_kernel_output(close_out, &mut *execution, &mut *publisher, &mut kernel)
-                            .await?;
+                        let close_stats = process_kernel_output(
+                            close_out,
+                            &mut *execution,
+                            &mut *publisher,
+                            &mut kernel,
+                            &correlation_id,
+                        )
+                        .await?;
+                        observability.apply_kernel_output_stats(&close_stats);
 
                         let close_event = WorkerStateEvent {
                             tenant_id: tick.tenant_id.clone(),
                             exchange: tick.exchange.clone(),
                             product_id: tick.product_id.clone(),
                             state_type: "daily_close_outcome".to_string(),
-                            payload: serde_json::to_value(&outcome)?,
+                            payload: with_correlation_payload(
+                                serde_json::to_value(&outcome)?,
+                                &correlation_id,
+                            ),
                             emitted_at_ts_ms: daily_close_event_ts,
                         };
                         publisher.publish(&close_event).await?;
@@ -276,6 +398,8 @@ pub async fn run() -> Result<()> {
                     total_fills,
                     &kernel,
                     last_tick.as_ref(),
+                    &observability,
+                    market_data_gap_warn_ms,
                 )
                 .await?;
                 control_plane.publish_heartbeat().await?;
@@ -360,6 +484,13 @@ fn read_env_bool(key: &str, default: bool) -> bool {
     }
 }
 
+fn read_env_i64(key: &str, default: i64) -> i64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
 async fn apply_runtime_commands(
     commands: Vec<RuntimeCommand>,
     config: &StrategyConfig,
@@ -368,6 +499,7 @@ async fn apply_runtime_commands(
     allow_reset_command: bool,
     publisher: &mut dyn StatePublisher,
     now_utc: DateTime<Utc>,
+    correlation_id: &str,
 ) -> Result<RuntimeCommandEffects> {
     let mut effects = RuntimeCommandEffects::default();
 
@@ -389,10 +521,13 @@ async fn apply_runtime_commands(
                         exchange: config.exchange.clone(),
                         product_id: config.product_id.clone(),
                         state_type: "command_reset_ignored".to_string(),
-                        payload: json!({
-                            "command_id": command_id,
-                            "reason": format!("{ENV_ALLOW_RESET_COMMAND}=false"),
-                        }),
+                        payload: with_correlation_payload(
+                            json!({
+                                "command_id": command_id,
+                                "reason": format!("{ENV_ALLOW_RESET_COMMAND}=false"),
+                            }),
+                            correlation_id,
+                        ),
                         emitted_at_ts_ms: now_ms(),
                     };
                     publisher.publish(&event).await?;
@@ -405,11 +540,14 @@ async fn apply_runtime_commands(
                     exchange: config.exchange.clone(),
                     product_id: config.product_id.clone(),
                     state_type: "command_reset_received".to_string(),
-                    payload: json!({
-                        "command_id": command_id,
-                        "reset_type": reset_type,
-                        "actor": actor,
-                    }),
+                    payload: with_correlation_payload(
+                        json!({
+                            "command_id": command_id,
+                            "reset_type": reset_type,
+                            "actor": actor,
+                        }),
+                        correlation_id,
+                    ),
                     emitted_at_ts_ms: now_ms(),
                 };
                 publisher.publish(&event).await?;
@@ -428,9 +566,12 @@ async fn apply_runtime_commands(
                     exchange: config.exchange.clone(),
                     product_id: config.product_id.clone(),
                     state_type: "command_skip_daily_close_received".to_string(),
-                    payload: json!({
-                        "command_id": command_id,
-                    }),
+                    payload: with_correlation_payload(
+                        json!({
+                            "command_id": command_id,
+                        }),
+                        correlation_id,
+                    ),
                     emitted_at_ts_ms: now_ms(),
                 };
                 publisher.publish(&event).await?;
@@ -455,11 +596,14 @@ async fn apply_runtime_commands(
                             exchange: config.exchange.clone(),
                             product_id: config.product_id.clone(),
                             state_type: "command_schedule_rejected".to_string(),
-                            payload: json!({
-                                "command_id": command_id,
-                                "reason": "invalid_mode",
-                                "mode": mode,
-                            }),
+                            payload: with_correlation_payload(
+                                json!({
+                                    "command_id": command_id,
+                                    "reason": "invalid_mode",
+                                    "mode": mode,
+                                }),
+                                correlation_id,
+                            ),
                             emitted_at_ts_ms: now_ms(),
                         };
                         publisher.publish(&event).await?;
@@ -482,13 +626,16 @@ async fn apply_runtime_commands(
                         exchange: config.exchange.clone(),
                         product_id: config.product_id.clone(),
                         state_type: "command_schedule_rejected".to_string(),
-                        payload: json!({
-                            "command_id": command_id,
-                            "reason": "invalid_timezone_or_time",
-                            "local_timezone_iana": local_timezone_iana,
-                            "daily_close_hour": daily_close_hour,
-                            "daily_close_minute": daily_close_minute,
-                        }),
+                        payload: with_correlation_payload(
+                            json!({
+                                "command_id": command_id,
+                                "reason": "invalid_timezone_or_time",
+                                "local_timezone_iana": local_timezone_iana,
+                                "daily_close_hour": daily_close_hour,
+                                "daily_close_minute": daily_close_minute,
+                            }),
+                            correlation_id,
+                        ),
                         emitted_at_ts_ms: now_ms(),
                     };
                     publisher.publish(&event).await?;
@@ -500,12 +647,15 @@ async fn apply_runtime_commands(
                     exchange: config.exchange.clone(),
                     product_id: config.product_id.clone(),
                     state_type: "daily_close_schedule_updated".to_string(),
-                    payload: json!({
-                        "command_id": command_id,
-                        "mode": mode,
-                        "daily_close_schedule": scheduler.schedule_payload(),
-                        "pending_daily_close_schedule": scheduler.pending_schedule_payload(),
-                    }),
+                    payload: with_correlation_payload(
+                        json!({
+                            "command_id": command_id,
+                            "mode": mode,
+                            "daily_close_schedule": scheduler.schedule_payload(),
+                            "pending_daily_close_schedule": scheduler.pending_schedule_payload(),
+                        }),
+                        correlation_id,
+                    ),
                     emitted_at_ts_ms: now_ms(),
                 };
                 publisher.publish(&event).await?;
@@ -543,6 +693,8 @@ async fn publish_runtime_state(
     total_fills: i64,
     kernel: &TradingKernel,
     last_tick: Option<&MarketTick>,
+    observability: &RuntimeObservability,
+    market_data_gap_warn_ms: i64,
 ) -> Result<()> {
     let now_utc = Utc::now();
     let uptime = (now_utc - started_at).num_seconds().max(0);
@@ -565,6 +717,23 @@ async fn publish_runtime_state(
         "total_fills": total_fills,
         "open_order_count": kernel.active_order_count(),
         "reference_mid": kernel.reference_mid(),
+        "observability": {
+            "ticks_processed": observability.ticks_processed,
+            "commands_processed": observability.commands_processed,
+            "last_command_batch_size": observability.last_command_batch_size,
+            "max_command_batch_size": observability.max_command_batch_size,
+            "orders_submitted": observability.orders_submitted,
+            "orders_canceled": observability.orders_canceled,
+            "liquidations_requested": observability.liquidations_requested,
+            "fills_processed": observability.fills_processed,
+            "kernel_events_published": observability.kernel_events_published,
+            "reconciliation_mismatches": observability.reconciliation_mismatches,
+            "market_data_gap_events": observability.market_data_gap_events,
+            "last_tick_gap_ms": observability.last_tick_gap_ms,
+            "max_tick_gap_ms": observability.max_tick_gap_ms,
+            "market_data_gap_warn_ms": market_data_gap_warn_ms,
+            "last_cycle_correlation_id": observability.last_cycle_correlation_id,
+        },
         "updated_at": now_utc.to_rfc3339(),
     });
 
@@ -583,7 +752,9 @@ async fn process_kernel_output(
     execution: &mut dyn ExecutionProvider,
     publisher: &mut dyn StatePublisher,
     kernel: &mut TradingKernel,
-) -> Result<()> {
+    correlation_id: &str,
+) -> Result<KernelOutputStats> {
+    let mut stats = KernelOutputStats::default();
     for decision in output.decisions {
         match decision {
             KernelDecision::PlaceOrder(order) => {
@@ -595,16 +766,21 @@ async fn process_kernel_output(
                         exchange: order.exchange,
                         product_id: order.product_id,
                         state_type: "order_submitted".to_string(),
-                        payload: json!({
-                            "order_id": order_id,
-                            "side": order.side,
-                            "price": order.price,
-                            "size_base": order.size_base,
-                            "post_only": order.post_only,
-                        }),
+                        payload: with_correlation_payload(
+                            json!({
+                                "order_id": order_id,
+                                "side": order.side,
+                                "price": order.price,
+                                "size_base": order.size_base,
+                                "post_only": order.post_only,
+                            }),
+                            correlation_id,
+                        ),
                         emitted_at_ts_ms: now_ms(),
                     })
                     .await?;
+                stats.orders_submitted += 1;
+                stats.events_published += 1;
             }
             KernelDecision::CancelOrder {
                 tenant_id,
@@ -622,10 +798,15 @@ async fn process_kernel_output(
                         exchange,
                         product_id,
                         state_type: "order_canceled".to_string(),
-                        payload: json!({ "order_id": order_id }),
+                        payload: with_correlation_payload(
+                            json!({ "order_id": order_id }),
+                            correlation_id,
+                        ),
                         emitted_at_ts_ms: now_ms(),
                     })
                     .await?;
+                stats.orders_canceled += 1;
+                stats.events_published += 1;
             }
             KernelDecision::LiquidateInventory {
                 tenant_id,
@@ -642,19 +823,26 @@ async fn process_kernel_output(
                         exchange,
                         product_id,
                         state_type: "inventory_liquidation_requested".to_string(),
-                        payload: json!({ "reason": reason }),
+                        payload: with_correlation_payload(
+                            json!({ "reason": reason }),
+                            correlation_id,
+                        ),
                         emitted_at_ts_ms: now_ms(),
                     })
                     .await?;
+                stats.liquidations_requested += 1;
+                stats.events_published += 1;
             }
             KernelDecision::Noop => {}
         }
     }
 
-    for event in output.events {
+    for mut event in output.events {
+        event.payload = with_correlation_payload(event.payload, correlation_id);
         publisher.publish(&event).await?;
+        stats.events_published += 1;
     }
-    Ok(())
+    Ok(stats)
 }
 
 fn now_ms() -> i64 {
@@ -664,6 +852,25 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or_default()
+}
+
+fn compute_tick_gap_ms(previous_tick_ts_ms: Option<i64>, current_tick_ts_ms: i64) -> Option<i64> {
+    previous_tick_ts_ms.map(|previous| current_tick_ts_ms - previous)
+}
+
+fn is_market_data_gap(gap_ms: i64, threshold_ms: i64) -> bool {
+    gap_ms >= 0 && gap_ms > threshold_ms
+}
+
+fn with_correlation_payload(payload: Value, correlation_id: &str) -> Value {
+    match payload {
+        Value::Object(mut map) => {
+            map.entry("correlation_id".to_string())
+                .or_insert_with(|| Value::String(correlation_id.to_string()));
+            Value::Object(map)
+        }
+        other => other,
+    }
 }
 
 fn synthesize_equity_snapshot(tick: &MarketTick) -> (f64, i64) {
@@ -924,5 +1131,29 @@ mod tests {
         assert_eq!(scheduler.schedule_payload()["daily_close_minute"], 15);
         assert_ne!(scheduler.next_close_utc(), prev);
         assert!(scheduler.pending_schedule_payload().is_none());
+    }
+
+    #[test]
+    fn tick_gap_detection_works_for_monotonic_stream() {
+        assert_eq!(compute_tick_gap_ms(None, 1_000), None);
+        assert_eq!(compute_tick_gap_ms(Some(1_000), 1_250), Some(250));
+        assert_eq!(compute_tick_gap_ms(Some(1_250), 1_100), Some(-150));
+    }
+
+    #[test]
+    fn market_data_gap_threshold_is_strict_and_non_negative() {
+        assert!(!is_market_data_gap(-1, 500));
+        assert!(!is_market_data_gap(500, 500));
+        assert!(is_market_data_gap(501, 500));
+    }
+
+    #[test]
+    fn correlation_id_is_attached_to_object_payload() {
+        let enriched =
+            with_correlation_payload(serde_json::json!({"state":"ok"}), "cycle:abc:1");
+        assert_eq!(enriched["correlation_id"], "cycle:abc:1");
+
+        let untouched = with_correlation_payload(serde_json::json!("plain"), "cycle:abc:1");
+        assert_eq!(untouched, serde_json::json!("plain"));
     }
 }
