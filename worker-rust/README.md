@@ -35,3 +35,6 @@ Este worker implementa el esqueleto de V4 con:
 - `TB_MARKET_DATA_GAP_WARN_MS` (threshold de alerta para `market_data_gap_detected`)
 - `TB_COMMAND_LAG_WARN_MS` (threshold de alerta para `command_lag_detected`)
 - `TB_HEARTBEAT_LAG_WARN_MS` (threshold de alerta para `heartbeat_lag_detected`)
+- `TB_CHAOS_REDIS_FAIL_EVERY_N` (simula fallo de Redis cada N operaciones)
+- `TB_CHAOS_BYBIT_MARKET_FAIL_EVERY_N` (simula fallo de market data Bybit cada N requests)
+- `TB_CHAOS_BYBIT_EXEC_FAIL_EVERY_N` (simula fallo de ejecucion Bybit cada N llamadas API)

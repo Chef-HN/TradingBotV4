@@ -11,6 +11,7 @@ use super::MarketDataProvider;
 const DEFAULT_BYBIT_BASE_URL: &str = "https://api.bybit.com";
 const DEFAULT_BYBIT_CATEGORY: &str = "spot";
 const DEFAULT_HTTP_TIMEOUT_MS: u64 = 5_000;
+const ENV_CHAOS_BYBIT_MARKET_FAIL_EVERY_N: &str = "TB_CHAOS_BYBIT_MARKET_FAIL_EVERY_N";
 
 pub struct BybitRestMarketDataProvider {
     tenant_id: String,
@@ -21,6 +22,8 @@ pub struct BybitRestMarketDataProvider {
     base_url: String,
     poll_interval: Duration,
     client: reqwest::Client,
+    chaos_fail_every_n: u64,
+    chaos_request_seq: u64,
 }
 
 impl BybitRestMarketDataProvider {
@@ -41,6 +44,7 @@ impl BybitRestMarketDataProvider {
             .unwrap_or_else(|| product_id_to_bybit_symbol(&config.product_id));
 
         let http_timeout_ms = read_env_u64("TB_MARKET_HTTP_TIMEOUT_MS", DEFAULT_HTTP_TIMEOUT_MS);
+        let chaos_fail_every_n = read_env_u64(ENV_CHAOS_BYBIT_MARKET_FAIL_EVERY_N, 0);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(http_timeout_ms.max(500)))
             .build()
@@ -55,6 +59,8 @@ impl BybitRestMarketDataProvider {
             base_url,
             poll_interval: Duration::from_millis(poll_interval_ms.max(100)),
             client,
+            chaos_fail_every_n,
+            chaos_request_seq: 0,
         })
     }
 
@@ -90,6 +96,14 @@ impl BybitRestMarketDataProvider {
 impl MarketDataProvider for BybitRestMarketDataProvider {
     async fn next_tick(&mut self) -> Result<MarketTick> {
         tokio::time::sleep(self.poll_interval).await;
+        self.chaos_request_seq = self.chaos_request_seq.saturating_add(1);
+        if should_inject_every_n(self.chaos_request_seq, self.chaos_fail_every_n) {
+            return Err(anyhow!(
+                "chaos injected bybit market data failure seq={} every_n={}",
+                self.chaos_request_seq,
+                self.chaos_fail_every_n
+            ));
+        }
         let (bid, ask, ts_ms) = self.fetch_quote().await?;
         let mid = if ask >= bid {
             (bid + ask) / 2.0
@@ -201,6 +215,10 @@ fn read_env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn should_inject_every_n(seq: u64, every_n: u64) -> bool {
+    every_n > 0 && seq > 0 && seq % every_n == 0
+}
+
 fn product_id_to_bybit_symbol(product_id: &str) -> String {
     let cleaned: String = product_id
         .chars()
@@ -292,5 +310,13 @@ mod tests {
         assert_eq!(bid, 0.152);
         assert_eq!(ask, 0.152);
         assert_eq!(ts, 1714022400001);
+    }
+
+    #[test]
+    fn should_inject_every_n_matches_expected_sequence() {
+        assert!(!should_inject_every_n(1, 0));
+        assert!(!should_inject_every_n(1, 4));
+        assert!(should_inject_every_n(4, 4));
+        assert!(should_inject_every_n(8, 4));
     }
 }

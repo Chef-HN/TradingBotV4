@@ -22,6 +22,7 @@ const DEFAULT_BYBIT_BASE_URL: &str = "https://api.bybit.com";
 const DEFAULT_BYBIT_CATEGORY: &str = "spot";
 const DEFAULT_RECV_WINDOW_MS: u64 = 5_000;
 const DEFAULT_HTTP_TIMEOUT_MS: u64 = 8_000;
+const ENV_CHAOS_BYBIT_EXEC_FAIL_EVERY_N: &str = "TB_CHAOS_BYBIT_EXEC_FAIL_EVERY_N";
 const MIN_LIQUIDATION_BASE_QTY: f64 = 1e-12;
 const MAX_SEEN_EXEC_IDS: usize = 200_000;
 
@@ -57,11 +58,26 @@ pub struct BybitLiveExecutionProvider {
     seq: AtomicU64,
     seen_exec_ids: HashSet<String>,
     local_open_order_ids: HashSet<String>,
+    chaos_call_seq: AtomicU64,
+    chaos_fail_every_n: u64,
     last_exec_time_ms: i64,
     rules_by_symbol: HashMap<String, BybitInstrumentRules>,
 }
 
 impl BybitLiveExecutionProvider {
+    fn maybe_inject_execution_chaos(&self, op_name: &str) -> Result<()> {
+        let seq = self.chaos_call_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        if should_inject_every_n(seq, self.chaos_fail_every_n) {
+            return Err(anyhow!(
+                "chaos injected bybit execution failure op={} seq={} every_n={}",
+                op_name,
+                seq,
+                self.chaos_fail_every_n
+            ));
+        }
+        Ok(())
+    }
+
     pub fn new_from_env() -> Result<Self> {
         let api_key = read_non_empty_env(&["TB_BYBIT_API_KEY", "BYBIT_API_KEY"])?;
         let api_secret = read_non_empty_env(&["TB_BYBIT_API_SECRET", "BYBIT_API_SECRET"])?;
@@ -76,6 +92,7 @@ impl BybitLiveExecutionProvider {
         let recv_window_ms = read_env_u64("TB_BYBIT_RECV_WINDOW_MS", DEFAULT_RECV_WINDOW_MS);
         let timeout_ms =
             read_env_u64("TB_BYBIT_HTTP_TIMEOUT_MS", DEFAULT_HTTP_TIMEOUT_MS).max(1_000);
+        let chaos_fail_every_n = read_env_u64(ENV_CHAOS_BYBIT_EXEC_FAIL_EVERY_N, 0);
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
@@ -92,6 +109,8 @@ impl BybitLiveExecutionProvider {
             seq: AtomicU64::new(0),
             seen_exec_ids: HashSet::new(),
             local_open_order_ids: HashSet::new(),
+            chaos_call_seq: AtomicU64::new(0),
+            chaos_fail_every_n,
             last_exec_time_ms: now_ms() - 10 * 60 * 1000,
             rules_by_symbol: HashMap::new(),
         })
@@ -102,6 +121,7 @@ impl BybitLiveExecutionProvider {
         path: &str,
         params: &[(String, String)],
     ) -> Result<(Value, Option<i64>)> {
+        self.maybe_inject_execution_chaos(path)?;
         let query = build_query_string(params)?;
         let timestamp_ms = now_ms();
         let headers = self.build_signed_headers(timestamp_ms, &query)?;
@@ -132,6 +152,7 @@ impl BybitLiveExecutionProvider {
     }
 
     async fn signed_post_result(&self, path: &str, body: &Value) -> Result<(Value, Option<i64>)> {
+        self.maybe_inject_execution_chaos(path)?;
         let body_str =
             serde_json::to_string(body).context("failed to serialize Bybit POST body")?;
         let timestamp_ms = now_ms();
@@ -649,6 +670,10 @@ fn read_env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn should_inject_every_n(seq: u64, every_n: u64) -> bool {
+    every_n > 0 && seq > 0 && seq % every_n == 0
+}
+
 fn product_id_to_bybit_symbol(product_id: &str) -> String {
     let normalized = product_id.trim();
     if normalized.is_empty() {
@@ -865,6 +890,8 @@ mod tests {
             seq: AtomicU64::new(0),
             seen_exec_ids: HashSet::new(),
             local_open_order_ids: HashSet::new(),
+            chaos_call_seq: AtomicU64::new(0),
+            chaos_fail_every_n: 0,
             last_exec_time_ms: 0,
             rules_by_symbol: HashMap::new(),
         };
@@ -901,6 +928,8 @@ mod tests {
             seq: AtomicU64::new(0),
             seen_exec_ids: HashSet::new(),
             local_open_order_ids: HashSet::new(),
+            chaos_call_seq: AtomicU64::new(0),
+            chaos_fail_every_n: 0,
             last_exec_time_ms: 0,
             rules_by_symbol: HashMap::new(),
         };
@@ -970,6 +999,8 @@ mod tests {
                 "oid-2".to_string(),
                 "oid-3".to_string(),
             ]),
+            chaos_call_seq: AtomicU64::new(0),
+            chaos_fail_every_n: 0,
             last_exec_time_ms: 0,
             rules_by_symbol: HashMap::new(),
         };
@@ -980,5 +1011,13 @@ mod tests {
             .expect("snapshot");
         assert_eq!(snap.provider_name, "bybit_live");
         assert_eq!(snap.open_order_count, 3);
+    }
+
+    #[test]
+    fn should_inject_every_n_matches_expected_sequence() {
+        assert!(!should_inject_every_n(1, 0));
+        assert!(!should_inject_every_n(2, 3));
+        assert!(should_inject_every_n(3, 3));
+        assert!(should_inject_every_n(6, 3));
     }
 }

@@ -12,6 +12,7 @@ const HEARTBEAT_TTL_SECONDS: usize = 15;
 const COMMAND_RESET: &str = "reset";
 const COMMAND_SKIP_DAILY_CLOSE: &str = "skip_daily_close";
 const COMMAND_UPDATE_DAILY_CLOSE_SCHEDULE: &str = "update_daily_close_schedule";
+const ENV_CHAOS_REDIS_FAIL_EVERY_N: &str = "TB_CHAOS_REDIS_FAIL_EVERY_N";
 
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
@@ -46,6 +47,8 @@ pub struct RedisControlPlane {
     state_key: String,
     commands_key: String,
     heartbeat_key: String,
+    chaos_fail_every_n: u64,
+    chaos_op_seq: u64,
     conn: MultiplexedConnection,
 }
 
@@ -75,6 +78,7 @@ impl RedisControlPlane {
         let ex = normalize_lower(exchange, "");
         let pid = normalize_product(product_id, "all");
         let state_pid = normalize_product(state_product_id, "all");
+        let chaos_fail_every_n = read_env_u64(ENV_CHAOS_REDIS_FAIL_EVERY_N, 0);
 
         Ok(Self {
             tenant_id: tid.clone(),
@@ -84,6 +88,8 @@ impl RedisControlPlane {
             state_key: format!("tb:v4:{tid}:{ex}:{state_pid}:state"),
             commands_key: format!("tb:v4:{tid}:{ex}:all:commands"),
             heartbeat_key: format!("tb:v4:{tid}:{ex}:{state_pid}:heartbeat"),
+            chaos_fail_every_n,
+            chaos_op_seq: 0,
             conn,
         })
     }
@@ -91,6 +97,7 @@ impl RedisControlPlane {
     pub async fn pop_commands(&mut self) -> Result<Vec<RuntimeCommand>> {
         let mut output = Vec::new();
         loop {
+            self.maybe_inject_redis_chaos("command_rpop")?;
             let raw: Option<String> = redis::cmd("RPOP")
                 .arg(&self.commands_key)
                 .query_async(&mut self.conn)
@@ -122,6 +129,7 @@ impl RedisControlPlane {
         });
 
         let payload = serde_json::to_string(&state).context("failed to serialize state payload")?;
+        self.maybe_inject_redis_chaos("state_set")?;
         redis::cmd("SET")
             .arg(&self.state_key)
             .arg(payload)
@@ -134,6 +142,7 @@ impl RedisControlPlane {
     }
 
     pub async fn publish_heartbeat(&mut self) -> Result<()> {
+        self.maybe_inject_redis_chaos("heartbeat_set")?;
         redis::cmd("SET")
             .arg(&self.heartbeat_key)
             .arg("1")
@@ -154,6 +163,19 @@ impl RedisControlPlane {
                 product_id: &self.product_id,
             },
         )
+    }
+
+    fn maybe_inject_redis_chaos(&mut self, op_name: &str) -> Result<()> {
+        self.chaos_op_seq = self.chaos_op_seq.saturating_add(1);
+        if should_inject_every_n(self.chaos_op_seq, self.chaos_fail_every_n) {
+            return Err(anyhow!(
+                "chaos injected redis failure op={} seq={} every_n={}",
+                op_name,
+                self.chaos_op_seq,
+                self.chaos_fail_every_n
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -297,6 +319,17 @@ fn as_i64(v: &Value) -> Option<i64> {
         Value::String(s) => s.parse::<i64>().ok(),
         _ => None,
     }
+}
+
+fn read_env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn should_inject_every_n(seq: u64, every_n: u64) -> bool {
+    every_n > 0 && seq > 0 && seq % every_n == 0
 }
 
 fn extract_command_lag_ms(payload: &Value, now_ts_ms: i64) -> Option<i64> {
@@ -535,5 +568,14 @@ mod tests {
             }
             _ => panic!("expected skip daily close"),
         }
+    }
+
+    #[test]
+    fn should_inject_every_n_matches_expected_sequence() {
+        assert!(!should_inject_every_n(1, 0));
+        assert!(!should_inject_every_n(1, 3));
+        assert!(!should_inject_every_n(2, 3));
+        assert!(should_inject_every_n(3, 3));
+        assert!(should_inject_every_n(6, 3));
     }
 }

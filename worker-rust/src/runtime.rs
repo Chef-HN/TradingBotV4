@@ -48,6 +48,7 @@ struct KernelOutputStats {
     orders_canceled: i64,
     liquidations_requested: i64,
     events_published: i64,
+    execution_failures: i64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -63,6 +64,11 @@ struct RuntimeObservability {
     kernel_events_published: i64,
     reconciliation_mismatches: i64,
     market_data_gap_events: i64,
+    market_data_failures: i64,
+    execution_failures: i64,
+    redis_command_poll_failures: i64,
+    redis_state_publish_failures: i64,
+    redis_heartbeat_publish_failures: i64,
     command_lag_events: i64,
     heartbeat_lag_events: i64,
     last_tick_gap_ms: Option<i64>,
@@ -102,6 +108,7 @@ impl RuntimeObservability {
         self.orders_canceled += stats.orders_canceled;
         self.liquidations_requested += stats.liquidations_requested;
         self.kernel_events_published += stats.events_published;
+        self.execution_failures += stats.execution_failures;
     }
 
     fn record_stage_latency(&mut self, stage: &str, latency_ms: i64) {
@@ -260,7 +267,7 @@ pub async fn run() -> Result<()> {
     );
 
     let state_publish_started = Instant::now();
-    publish_runtime_state(
+    if let Err(err) = publish_runtime_state(
         &mut control_plane,
         &config,
         &mode,
@@ -278,11 +285,44 @@ pub async fn run() -> Result<()> {
         command_lag_warn_ms,
         heartbeat_lag_warn_ms,
     )
-    .await?;
+    .await
+    {
+        observability.redis_state_publish_failures += 1;
+        let event = WorkerStateEvent {
+            tenant_id: config.tenant_id.clone(),
+            exchange: config.exchange.clone(),
+            product_id: config.product_id.clone(),
+            state_type: "redis_state_publish_failed".to_string(),
+            payload: with_correlation_payload(
+                json!({
+                    "error": err.to_string(),
+                }),
+                "startup",
+            ),
+            emitted_at_ts_ms: now_ms(),
+        };
+        publisher.publish(&event).await?;
+    }
     observability.record_stage_latency("state_publish", elapsed_ms(state_publish_started));
 
     let heartbeat_publish_started = Instant::now();
-    control_plane.publish_heartbeat().await?;
+    if let Err(err) = control_plane.publish_heartbeat().await {
+        observability.redis_heartbeat_publish_failures += 1;
+        let event = WorkerStateEvent {
+            tenant_id: config.tenant_id.clone(),
+            exchange: config.exchange.clone(),
+            product_id: config.product_id.clone(),
+            state_type: "redis_heartbeat_publish_failed".to_string(),
+            payload: with_correlation_payload(
+                json!({
+                    "error": err.to_string(),
+                }),
+                "startup",
+            ),
+            emitted_at_ts_ms: now_ms(),
+        };
+        publisher.publish(&event).await?;
+    }
     observability.record_stage_latency("heartbeat_publish", elapsed_ms(heartbeat_publish_started));
     let mut last_heartbeat_publish_ts_ms = now_ms();
 
@@ -307,7 +347,27 @@ pub async fn run() -> Result<()> {
                 observability.record_stage_latency("market_data", market_data_latency_ms);
                 let now_utc = Utc::now();
                 let command_poll_started = Instant::now();
-                let commands = control_plane.pop_commands().await?;
+                let commands = match control_plane.pop_commands().await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        observability.redis_command_poll_failures += 1;
+                        let event = WorkerStateEvent {
+                            tenant_id: config.tenant_id.clone(),
+                            exchange: config.exchange.clone(),
+                            product_id: config.product_id.clone(),
+                            state_type: "redis_command_poll_failed".to_string(),
+                            payload: with_correlation_payload(
+                                json!({
+                                    "error": err.to_string(),
+                                }),
+                                &correlation_id,
+                            ),
+                            emitted_at_ts_ms: now_ms(),
+                        };
+                        publisher.publish(&event).await?;
+                        Vec::new()
+                    }
+                };
                 observability
                     .record_stage_latency("command_poll", elapsed_ms(command_poll_started));
                 let command_batch_size = commands.len() as i64;
@@ -394,7 +454,23 @@ pub async fn run() -> Result<()> {
                             publisher.publish(&replay_done).await?;
                             break;
                         }
-                        return Err(err);
+                        observability.market_data_failures += 1;
+                        let provider_error = WorkerStateEvent {
+                            tenant_id: config.tenant_id.clone(),
+                            exchange: config.exchange.clone(),
+                            product_id: config.product_id.clone(),
+                            state_type: "market_data_provider_error".to_string(),
+                            payload: with_correlation_payload(
+                                json!({
+                                    "market_data_provider": market_data_provider_name.as_str(),
+                                    "error": err.to_string(),
+                                }),
+                                &correlation_id,
+                            ),
+                            emitted_at_ts_ms: now_ms(),
+                        };
+                        publisher.publish(&provider_error).await?;
+                        continue;
                     }
                 };
 
@@ -426,7 +502,24 @@ pub async fn run() -> Result<()> {
                 }
                 last_tick_event_ts_ms = Some(tick.event_ts_ms);
                 let execution_started = Instant::now();
-                execution.on_market_tick(&tick).await?;
+                if let Err(err) = execution.on_market_tick(&tick).await {
+                    observability.execution_failures += 1;
+                    let execution_event = WorkerStateEvent {
+                        tenant_id: tick.tenant_id.clone(),
+                        exchange: tick.exchange.clone(),
+                        product_id: tick.product_id.clone(),
+                        state_type: "execution_on_tick_failed".to_string(),
+                        payload: with_correlation_payload(
+                            json!({
+                                "error": err.to_string(),
+                            }),
+                            &correlation_id,
+                        ),
+                        emitted_at_ts_ms: now_ms(),
+                    };
+                    publisher.publish(&execution_event).await?;
+                    continue;
+                }
                 observability.record_stage_latency("execution_on_tick", elapsed_ms(execution_started));
 
                 let kernel_started = Instant::now();
@@ -443,9 +536,30 @@ pub async fn run() -> Result<()> {
                 observability.apply_kernel_output_stats(&output_stats);
 
                 let fill_flush_started = Instant::now();
-                let fills = execution
+                let fills = match execution
                     .flush_fills(&tick.tenant_id, &tick.exchange, &tick.product_id)
-                    .await?;
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(err) => {
+                        observability.execution_failures += 1;
+                        let event = WorkerStateEvent {
+                            tenant_id: tick.tenant_id.clone(),
+                            exchange: tick.exchange.clone(),
+                            product_id: tick.product_id.clone(),
+                            state_type: "execution_flush_fills_failed".to_string(),
+                            payload: with_correlation_payload(
+                                json!({
+                                    "error": err.to_string(),
+                                }),
+                                &correlation_id,
+                            ),
+                            emitted_at_ts_ms: now_ms(),
+                        };
+                        publisher.publish(&event).await?;
+                        Vec::new()
+                    }
+                };
                 observability.record_stage_latency("fill_flush", elapsed_ms(fill_flush_started));
                 let fill_process_started = Instant::now();
                 for fill in fills {
@@ -467,28 +581,49 @@ pub async fn run() -> Result<()> {
                 let reconciliation_started = Instant::now();
                 let reconciliation = execution
                     .reconciliation_snapshot(&tick.tenant_id, &tick.exchange, &tick.product_id)
-                    .await?;
+                    .await;
                 observability.record_stage_latency("reconciliation", elapsed_ms(reconciliation_started));
-                let kernel_open_order_count = kernel.active_order_count();
-                if reconciliation.open_order_count != kernel_open_order_count {
-                    observability.reconciliation_mismatches += 1;
-                    let mismatch_event = WorkerStateEvent {
-                        tenant_id: tick.tenant_id.clone(),
-                        exchange: tick.exchange.clone(),
-                        product_id: tick.product_id.clone(),
-                        state_type: "execution_reconciliation_mismatch".to_string(),
-                        payload: with_correlation_payload(
-                            json!({
-                                "provider": reconciliation.provider_name,
-                                "provider_open_order_count": reconciliation.open_order_count,
-                                "kernel_open_order_count": kernel_open_order_count,
-                                "total_fills": total_fills,
-                            }),
-                            &correlation_id,
-                        ),
-                        emitted_at_ts_ms: now_ms(),
-                    };
-                    publisher.publish(&mismatch_event).await?;
+                match reconciliation {
+                    Ok(reconciliation) => {
+                        let kernel_open_order_count = kernel.active_order_count();
+                        if reconciliation.open_order_count != kernel_open_order_count {
+                            observability.reconciliation_mismatches += 1;
+                            let mismatch_event = WorkerStateEvent {
+                                tenant_id: tick.tenant_id.clone(),
+                                exchange: tick.exchange.clone(),
+                                product_id: tick.product_id.clone(),
+                                state_type: "execution_reconciliation_mismatch".to_string(),
+                                payload: with_correlation_payload(
+                                    json!({
+                                        "provider": reconciliation.provider_name,
+                                        "provider_open_order_count": reconciliation.open_order_count,
+                                        "kernel_open_order_count": kernel_open_order_count,
+                                        "total_fills": total_fills,
+                                    }),
+                                    &correlation_id,
+                                ),
+                                emitted_at_ts_ms: now_ms(),
+                            };
+                            publisher.publish(&mismatch_event).await?;
+                        }
+                    }
+                    Err(err) => {
+                        observability.execution_failures += 1;
+                        let event = WorkerStateEvent {
+                            tenant_id: tick.tenant_id.clone(),
+                            exchange: tick.exchange.clone(),
+                            product_id: tick.product_id.clone(),
+                            state_type: "execution_reconciliation_snapshot_failed".to_string(),
+                            payload: with_correlation_payload(
+                                json!({
+                                    "error": err.to_string(),
+                                }),
+                                &correlation_id,
+                            ),
+                            emitted_at_ts_ms: now_ms(),
+                        };
+                        publisher.publish(&event).await?;
+                    }
                 }
 
                 let now_utc = Utc::now();
@@ -552,7 +687,7 @@ pub async fn run() -> Result<()> {
 
                 last_tick = Some(tick);
                 let state_publish_started = Instant::now();
-                publish_runtime_state(
+                if let Err(err) = publish_runtime_state(
                     &mut control_plane,
                     &config,
                     &mode,
@@ -570,10 +705,43 @@ pub async fn run() -> Result<()> {
                     command_lag_warn_ms,
                     heartbeat_lag_warn_ms,
                 )
-                .await?;
+                .await
+                {
+                    observability.redis_state_publish_failures += 1;
+                    let event = WorkerStateEvent {
+                        tenant_id: config.tenant_id.clone(),
+                        exchange: config.exchange.clone(),
+                        product_id: config.product_id.clone(),
+                        state_type: "redis_state_publish_failed".to_string(),
+                        payload: with_correlation_payload(
+                            json!({
+                                "error": err.to_string(),
+                            }),
+                            &correlation_id,
+                        ),
+                        emitted_at_ts_ms: now_ms(),
+                    };
+                    publisher.publish(&event).await?;
+                }
                 observability.record_stage_latency("state_publish", elapsed_ms(state_publish_started));
                 let heartbeat_publish_started = Instant::now();
-                control_plane.publish_heartbeat().await?;
+                if let Err(err) = control_plane.publish_heartbeat().await {
+                    observability.redis_heartbeat_publish_failures += 1;
+                    let event = WorkerStateEvent {
+                        tenant_id: config.tenant_id.clone(),
+                        exchange: config.exchange.clone(),
+                        product_id: config.product_id.clone(),
+                        state_type: "redis_heartbeat_publish_failed".to_string(),
+                        payload: with_correlation_payload(
+                            json!({
+                                "error": err.to_string(),
+                            }),
+                            &correlation_id,
+                        ),
+                        emitted_at_ts_ms: now_ms(),
+                    };
+                    publisher.publish(&event).await?;
+                }
                 observability.record_stage_latency(
                     "heartbeat_publish",
                     elapsed_ms(heartbeat_publish_started),
@@ -728,6 +896,7 @@ async fn apply_runtime_commands(
                             json!({
                                 "command_id": command_id,
                                 "reason": format!("{ENV_ALLOW_RESET_COMMAND}=false"),
+                                "command_lag_ms": command_lag_ms,
                             }),
                             correlation_id,
                         ),
@@ -748,6 +917,7 @@ async fn apply_runtime_commands(
                             "command_id": command_id,
                             "reset_type": reset_type,
                             "actor": actor,
+                            "command_lag_ms": command_lag_ms,
                         }),
                         correlation_id,
                     ),
@@ -774,6 +944,7 @@ async fn apply_runtime_commands(
                     payload: with_correlation_payload(
                         json!({
                             "command_id": command_id,
+                            "command_lag_ms": command_lag_ms,
                         }),
                         correlation_id,
                     ),
@@ -808,6 +979,7 @@ async fn apply_runtime_commands(
                                     "command_id": command_id,
                                     "reason": "invalid_mode",
                                     "mode": mode,
+                                    "command_lag_ms": command_lag_ms,
                                 }),
                                 correlation_id,
                             ),
@@ -834,13 +1006,14 @@ async fn apply_runtime_commands(
                         product_id: config.product_id.clone(),
                         state_type: "command_schedule_rejected".to_string(),
                         payload: with_correlation_payload(
-                            json!({
-                                "command_id": command_id,
-                                "reason": "invalid_timezone_or_time",
-                                "local_timezone_iana": local_timezone_iana,
-                                "daily_close_hour": daily_close_hour,
-                                "daily_close_minute": daily_close_minute,
-                            }),
+                                json!({
+                                    "command_id": command_id,
+                                    "reason": "invalid_timezone_or_time",
+                                    "local_timezone_iana": local_timezone_iana,
+                                    "daily_close_hour": daily_close_hour,
+                                    "daily_close_minute": daily_close_minute,
+                                    "command_lag_ms": command_lag_ms,
+                                }),
                             correlation_id,
                         ),
                         emitted_at_ts_ms: now_ms(),
@@ -860,6 +1033,7 @@ async fn apply_runtime_commands(
                             "mode": mode,
                             "daily_close_schedule": scheduler.schedule_payload(),
                             "pending_daily_close_schedule": scheduler.pending_schedule_payload(),
+                            "command_lag_ms": command_lag_ms,
                         }),
                         correlation_id,
                     ),
@@ -945,6 +1119,11 @@ async fn publish_runtime_state(
         "kernel_events_published": observability.kernel_events_published,
         "reconciliation_mismatches": observability.reconciliation_mismatches,
         "market_data_gap_events": observability.market_data_gap_events,
+        "market_data_failures": observability.market_data_failures,
+        "execution_failures": observability.execution_failures,
+        "redis_command_poll_failures": observability.redis_command_poll_failures,
+        "redis_state_publish_failures": observability.redis_state_publish_failures,
+        "redis_heartbeat_publish_failures": observability.redis_heartbeat_publish_failures,
         "command_lag_events": observability.command_lag_events,
         "heartbeat_lag_events": observability.heartbeat_lag_events,
         "last_tick_gap_ms": observability.last_tick_gap_ms,
@@ -1003,29 +1182,54 @@ async fn process_kernel_output(
     for decision in output.decisions {
         match decision {
             KernelDecision::PlaceOrder(order) => {
-                let order_id = execution.submit(&order).await?;
-                kernel.register_open_order(order_id.clone());
-                publisher
-                    .publish(&WorkerStateEvent {
-                        tenant_id: order.tenant_id,
-                        exchange: order.exchange,
-                        product_id: order.product_id,
-                        state_type: "order_submitted".to_string(),
-                        payload: with_correlation_payload(
-                            json!({
-                                "order_id": order_id,
-                                "side": order.side,
-                                "price": order.price,
-                                "size_base": order.size_base,
-                                "post_only": order.post_only,
-                            }),
-                            correlation_id,
-                        ),
-                        emitted_at_ts_ms: now_ms(),
-                    })
-                    .await?;
-                stats.orders_submitted += 1;
-                stats.events_published += 1;
+                match execution.submit(&order).await {
+                    Ok(order_id) => {
+                        kernel.register_open_order(order_id.clone());
+                        publisher
+                            .publish(&WorkerStateEvent {
+                                tenant_id: order.tenant_id,
+                                exchange: order.exchange,
+                                product_id: order.product_id,
+                                state_type: "order_submitted".to_string(),
+                                payload: with_correlation_payload(
+                                    json!({
+                                        "order_id": order_id,
+                                        "side": order.side,
+                                        "price": order.price,
+                                        "size_base": order.size_base,
+                                        "post_only": order.post_only,
+                                    }),
+                                    correlation_id,
+                                ),
+                                emitted_at_ts_ms: now_ms(),
+                            })
+                            .await?;
+                        stats.orders_submitted += 1;
+                        stats.events_published += 1;
+                    }
+                    Err(err) => {
+                        stats.execution_failures += 1;
+                        publisher
+                            .publish(&WorkerStateEvent {
+                                tenant_id: order.tenant_id,
+                                exchange: order.exchange,
+                                product_id: order.product_id,
+                                state_type: "execution_submit_failed".to_string(),
+                                payload: with_correlation_payload(
+                                    json!({
+                                        "error": err.to_string(),
+                                        "side": order.side,
+                                        "price": order.price,
+                                        "size_base": order.size_base,
+                                    }),
+                                    correlation_id,
+                                ),
+                                emitted_at_ts_ms: now_ms(),
+                            })
+                            .await?;
+                        stats.events_published += 1;
+                    }
+                }
             }
             KernelDecision::CancelOrder {
                 tenant_id,
@@ -1033,25 +1237,49 @@ async fn process_kernel_output(
                 product_id,
                 order_id,
             } => {
-                execution
+                match execution
                     .cancel(&tenant_id, &exchange, &product_id, &order_id)
-                    .await?;
-                kernel.forget_open_order(&order_id);
-                publisher
-                    .publish(&WorkerStateEvent {
-                        tenant_id,
-                        exchange,
-                        product_id,
-                        state_type: "order_canceled".to_string(),
-                        payload: with_correlation_payload(
-                            json!({ "order_id": order_id }),
-                            correlation_id,
-                        ),
-                        emitted_at_ts_ms: now_ms(),
-                    })
-                    .await?;
-                stats.orders_canceled += 1;
-                stats.events_published += 1;
+                    .await
+                {
+                    Ok(()) => {
+                        kernel.forget_open_order(&order_id);
+                        publisher
+                            .publish(&WorkerStateEvent {
+                                tenant_id,
+                                exchange,
+                                product_id,
+                                state_type: "order_canceled".to_string(),
+                                payload: with_correlation_payload(
+                                    json!({ "order_id": order_id }),
+                                    correlation_id,
+                                ),
+                                emitted_at_ts_ms: now_ms(),
+                            })
+                            .await?;
+                        stats.orders_canceled += 1;
+                        stats.events_published += 1;
+                    }
+                    Err(err) => {
+                        stats.execution_failures += 1;
+                        publisher
+                            .publish(&WorkerStateEvent {
+                                tenant_id,
+                                exchange,
+                                product_id,
+                                state_type: "execution_cancel_failed".to_string(),
+                                payload: with_correlation_payload(
+                                    json!({
+                                        "error": err.to_string(),
+                                        "order_id": order_id,
+                                    }),
+                                    correlation_id,
+                                ),
+                                emitted_at_ts_ms: now_ms(),
+                            })
+                            .await?;
+                        stats.events_published += 1;
+                    }
+                }
             }
             KernelDecision::LiquidateInventory {
                 tenant_id,
@@ -1059,24 +1287,48 @@ async fn process_kernel_output(
                 product_id,
                 reason,
             } => {
-                execution
+                match execution
                     .liquidate_inventory(&tenant_id, &exchange, &product_id)
-                    .await?;
-                publisher
-                    .publish(&WorkerStateEvent {
-                        tenant_id,
-                        exchange,
-                        product_id,
-                        state_type: "inventory_liquidation_requested".to_string(),
-                        payload: with_correlation_payload(
-                            json!({ "reason": reason }),
-                            correlation_id,
-                        ),
-                        emitted_at_ts_ms: now_ms(),
-                    })
-                    .await?;
-                stats.liquidations_requested += 1;
-                stats.events_published += 1;
+                    .await
+                {
+                    Ok(()) => {
+                        publisher
+                            .publish(&WorkerStateEvent {
+                                tenant_id,
+                                exchange,
+                                product_id,
+                                state_type: "inventory_liquidation_requested".to_string(),
+                                payload: with_correlation_payload(
+                                    json!({ "reason": reason }),
+                                    correlation_id,
+                                ),
+                                emitted_at_ts_ms: now_ms(),
+                            })
+                            .await?;
+                        stats.liquidations_requested += 1;
+                        stats.events_published += 1;
+                    }
+                    Err(err) => {
+                        stats.execution_failures += 1;
+                        publisher
+                            .publish(&WorkerStateEvent {
+                                tenant_id,
+                                exchange,
+                                product_id,
+                                state_type: "execution_liquidation_failed".to_string(),
+                                payload: with_correlation_payload(
+                                    json!({
+                                        "error": err.to_string(),
+                                        "reason": reason,
+                                    }),
+                                    correlation_id,
+                                ),
+                                emitted_at_ts_ms: now_ms(),
+                            })
+                            .await?;
+                        stats.events_published += 1;
+                    }
+                }
             }
             KernelDecision::Noop => {}
         }
@@ -1409,5 +1661,28 @@ mod tests {
 
         let untouched = with_correlation_payload(serde_json::json!("plain"), "cycle:abc:1");
         assert_eq!(untouched, serde_json::json!("plain"));
+    }
+
+    #[test]
+    fn command_effects_tracks_max_lag() {
+        let mut effects = RuntimeCommandEffects::default();
+        effects.observe_command_lag(None);
+        effects.observe_command_lag(Some(120));
+        effects.observe_command_lag(Some(80));
+        effects.observe_command_lag(Some(220));
+        assert_eq!(effects.lagged_commands, 3);
+        assert_eq!(effects.max_command_lag_ms, Some(220));
+    }
+
+    #[test]
+    fn update_latency_metric_tracks_last_and_max() {
+        let mut last = 0;
+        let mut max = 0;
+        update_latency_metric(&mut last, &mut max, 15);
+        assert_eq!(last, 15);
+        assert_eq!(max, 15);
+        update_latency_metric(&mut last, &mut max, 7);
+        assert_eq!(last, 7);
+        assert_eq!(max, 15);
     }
 }
