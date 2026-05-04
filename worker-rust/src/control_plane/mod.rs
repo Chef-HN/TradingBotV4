@@ -20,10 +20,12 @@ pub enum RuntimeCommand {
         product_id: String,
         actor: Option<String>,
         reset_type: String,
+        command_lag_ms: Option<i64>,
     },
     SkipDailyClose {
         command_id: String,
         product_id: String,
+        command_lag_ms: Option<i64>,
     },
     UpdateDailyCloseSchedule {
         command_id: String,
@@ -32,6 +34,7 @@ pub enum RuntimeCommand {
         daily_close_hour: u8,
         daily_close_minute: u8,
         mode: String,
+        command_lag_ms: Option<i64>,
     },
 }
 
@@ -191,6 +194,7 @@ fn parse_command_for_scope(raw: &str, scope: &CommandScope<'_>) -> Result<Option
         .unwrap_or_else(|| format!("redis-{}", now_ms()));
 
     let payload = merged_payload(envelope.payload, envelope.extra);
+    let command_lag_ms = extract_command_lag_ms(&payload, now_ms());
     match cmd_type.as_str() {
         COMMAND_RESET => {
             let reset_type = payload
@@ -210,11 +214,13 @@ fn parse_command_for_scope(raw: &str, scope: &CommandScope<'_>) -> Result<Option
                 product_id,
                 actor,
                 reset_type,
+                command_lag_ms,
             }))
         }
         COMMAND_SKIP_DAILY_CLOSE => Ok(Some(RuntimeCommand::SkipDailyClose {
             command_id,
             product_id,
+            command_lag_ms,
         })),
         COMMAND_UPDATE_DAILY_CLOSE_SCHEDULE => {
             let tz = payload
@@ -246,6 +252,7 @@ fn parse_command_for_scope(raw: &str, scope: &CommandScope<'_>) -> Result<Option
                 daily_close_hour: hour as u8,
                 daily_close_minute: minute as u8,
                 mode,
+                command_lag_ms,
             }))
         }
         _ => Ok(None),
@@ -290,6 +297,28 @@ fn as_i64(v: &Value) -> Option<i64> {
         Value::String(s) => s.parse::<i64>().ok(),
         _ => None,
     }
+}
+
+fn extract_command_lag_ms(payload: &Value, now_ts_ms: i64) -> Option<i64> {
+    let candidates = [
+        "created_at_ts_ms",
+        "issued_at_ts_ms",
+        "emitted_at_ts_ms",
+        "timestamp_ts_ms",
+        "timestamp_ms",
+        "ts_ms",
+    ];
+
+    for key in candidates {
+        let Some(raw) = payload.get(key).and_then(as_i64) else {
+            continue;
+        };
+        let lag = now_ts_ms - raw;
+        if lag >= 0 {
+            return Some(lag);
+        }
+    }
+    None
 }
 
 fn normalize_lower(value: &str, fallback: &str) -> String {
@@ -475,5 +504,36 @@ mod tests {
         )
         .expect("parse ok");
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parses_command_lag_from_payload_timestamp() {
+        let now = now_ms();
+        let raw = json!({
+            "type":"skip_daily_close",
+            "tenant_id":"t1",
+            "exchange":"bybit",
+            "product_id":"SOL-USD",
+            "created_at_ts_ms": now - 1234
+        })
+        .to_string();
+
+        let parsed = parse_command_for_scope(
+            &raw,
+            &CommandScope {
+                tenant_id: "t1",
+                exchange: "bybit",
+                product_id: "SOL-USD",
+            },
+        )
+        .expect("parse ok");
+
+        match parsed {
+            Some(RuntimeCommand::SkipDailyClose { command_lag_ms, .. }) => {
+                let lag = command_lag_ms.expect("lag");
+                assert!(lag >= 1200);
+            }
+            _ => panic!("expected skip daily close"),
+        }
     }
 }

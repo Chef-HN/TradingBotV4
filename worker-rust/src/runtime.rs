@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde_json::{json, Value};
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::{
@@ -31,10 +32,14 @@ const SCHEDULE_MODE_IMMEDIATE: &str = "immediate";
 const SCHEDULE_MODE_NEXT_CYCLE: &str = "next_cycle";
 const ENV_ALLOW_RESET_COMMAND: &str = "TB_ALLOW_RESET_COMMAND";
 const ENV_MARKET_DATA_GAP_WARN_MS: &str = "TB_MARKET_DATA_GAP_WARN_MS";
+const ENV_COMMAND_LAG_WARN_MS: &str = "TB_COMMAND_LAG_WARN_MS";
+const ENV_HEARTBEAT_LAG_WARN_MS: &str = "TB_HEARTBEAT_LAG_WARN_MS";
 
 #[derive(Debug, Default)]
 struct RuntimeCommandEffects {
     reset_kernel: bool,
+    max_command_lag_ms: Option<i64>,
+    lagged_commands: i64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -58,8 +63,36 @@ struct RuntimeObservability {
     kernel_events_published: i64,
     reconciliation_mismatches: i64,
     market_data_gap_events: i64,
+    command_lag_events: i64,
+    heartbeat_lag_events: i64,
     last_tick_gap_ms: Option<i64>,
     max_tick_gap_ms: i64,
+    last_command_lag_ms: Option<i64>,
+    max_command_lag_ms: i64,
+    last_heartbeat_gap_ms: Option<i64>,
+    max_heartbeat_gap_ms: i64,
+    last_market_data_latency_ms: i64,
+    max_market_data_latency_ms: i64,
+    last_command_poll_latency_ms: i64,
+    max_command_poll_latency_ms: i64,
+    last_command_apply_latency_ms: i64,
+    max_command_apply_latency_ms: i64,
+    last_execution_latency_ms: i64,
+    max_execution_latency_ms: i64,
+    last_kernel_latency_ms: i64,
+    max_kernel_latency_ms: i64,
+    last_fill_flush_latency_ms: i64,
+    max_fill_flush_latency_ms: i64,
+    last_fill_process_latency_ms: i64,
+    max_fill_process_latency_ms: i64,
+    last_reconciliation_latency_ms: i64,
+    max_reconciliation_latency_ms: i64,
+    last_daily_close_latency_ms: i64,
+    max_daily_close_latency_ms: i64,
+    last_state_publish_latency_ms: i64,
+    max_state_publish_latency_ms: i64,
+    last_heartbeat_publish_latency_ms: i64,
+    max_heartbeat_publish_latency_ms: i64,
     last_cycle_correlation_id: Option<String>,
 }
 
@@ -69,6 +102,80 @@ impl RuntimeObservability {
         self.orders_canceled += stats.orders_canceled;
         self.liquidations_requested += stats.liquidations_requested;
         self.kernel_events_published += stats.events_published;
+    }
+
+    fn record_stage_latency(&mut self, stage: &str, latency_ms: i64) {
+        match stage {
+            "market_data" => update_latency_metric(
+                &mut self.last_market_data_latency_ms,
+                &mut self.max_market_data_latency_ms,
+                latency_ms,
+            ),
+            "command_poll" => update_latency_metric(
+                &mut self.last_command_poll_latency_ms,
+                &mut self.max_command_poll_latency_ms,
+                latency_ms,
+            ),
+            "command_apply" => update_latency_metric(
+                &mut self.last_command_apply_latency_ms,
+                &mut self.max_command_apply_latency_ms,
+                latency_ms,
+            ),
+            "execution_on_tick" => update_latency_metric(
+                &mut self.last_execution_latency_ms,
+                &mut self.max_execution_latency_ms,
+                latency_ms,
+            ),
+            "kernel_tick" => update_latency_metric(
+                &mut self.last_kernel_latency_ms,
+                &mut self.max_kernel_latency_ms,
+                latency_ms,
+            ),
+            "fill_flush" => update_latency_metric(
+                &mut self.last_fill_flush_latency_ms,
+                &mut self.max_fill_flush_latency_ms,
+                latency_ms,
+            ),
+            "fill_process" => update_latency_metric(
+                &mut self.last_fill_process_latency_ms,
+                &mut self.max_fill_process_latency_ms,
+                latency_ms,
+            ),
+            "reconciliation" => update_latency_metric(
+                &mut self.last_reconciliation_latency_ms,
+                &mut self.max_reconciliation_latency_ms,
+                latency_ms,
+            ),
+            "daily_close" => update_latency_metric(
+                &mut self.last_daily_close_latency_ms,
+                &mut self.max_daily_close_latency_ms,
+                latency_ms,
+            ),
+            "state_publish" => update_latency_metric(
+                &mut self.last_state_publish_latency_ms,
+                &mut self.max_state_publish_latency_ms,
+                latency_ms,
+            ),
+            "heartbeat_publish" => update_latency_metric(
+                &mut self.last_heartbeat_publish_latency_ms,
+                &mut self.max_heartbeat_publish_latency_ms,
+                latency_ms,
+            ),
+            _ => {}
+        }
+    }
+}
+
+impl RuntimeCommandEffects {
+    fn observe_command_lag(&mut self, command_lag_ms: Option<i64>) {
+        let Some(lag_ms) = command_lag_ms else {
+            return;
+        };
+        self.lagged_commands += 1;
+        self.max_command_lag_ms = Some(match self.max_command_lag_ms {
+            Some(current) => current.max(lag_ms),
+            None => lag_ms,
+        });
     }
 }
 
@@ -125,6 +232,9 @@ pub async fn run() -> Result<()> {
     let default_gap_warn_ms = ((tick_interval_ms as i64) * 3).max(5_000);
     let market_data_gap_warn_ms =
         read_env_i64(ENV_MARKET_DATA_GAP_WARN_MS, default_gap_warn_ms).max(250);
+    let command_lag_warn_ms =
+        read_env_i64(ENV_COMMAND_LAG_WARN_MS, (tick_interval_ms as i64).max(1_500)).max(100);
+    let heartbeat_lag_warn_ms = read_env_i64(ENV_HEARTBEAT_LAG_WARN_MS, 12_000).max(250);
 
     let mut control_plane = RedisControlPlane::connect(
         &sources.redis_url,
@@ -149,6 +259,7 @@ pub async fn run() -> Result<()> {
         })
     );
 
+    let state_publish_started = Instant::now();
     publish_runtime_state(
         &mut control_plane,
         &config,
@@ -164,9 +275,16 @@ pub async fn run() -> Result<()> {
         last_tick.as_ref(),
         &observability,
         market_data_gap_warn_ms,
+        command_lag_warn_ms,
+        heartbeat_lag_warn_ms,
     )
     .await?;
+    observability.record_stage_latency("state_publish", elapsed_ms(state_publish_started));
+
+    let heartbeat_publish_started = Instant::now();
     control_plane.publish_heartbeat().await?;
+    observability.record_stage_latency("heartbeat_publish", elapsed_ms(heartbeat_publish_started));
+    let mut last_heartbeat_publish_ts_ms = now_ms();
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -177,17 +295,27 @@ pub async fn run() -> Result<()> {
                 println!("{}", json!({"state_type":"worker_shutdown"}));
                 break;
             }
-            tick = market_data.next_tick() => {
+            market_data_out = async {
+                let started = Instant::now();
+                let tick = market_data.next_tick().await;
+                (tick, elapsed_ms(started))
+            } => {
                 cycle_seq = cycle_seq.saturating_add(1);
                 let correlation_id = format!("cycle:{}:{cycle_seq}", session_id);
                 observability.last_cycle_correlation_id = Some(correlation_id.clone());
+                let (tick, market_data_latency_ms) = market_data_out;
+                observability.record_stage_latency("market_data", market_data_latency_ms);
                 let now_utc = Utc::now();
+                let command_poll_started = Instant::now();
                 let commands = control_plane.pop_commands().await?;
+                observability
+                    .record_stage_latency("command_poll", elapsed_ms(command_poll_started));
                 let command_batch_size = commands.len() as i64;
                 observability.commands_processed += command_batch_size;
                 observability.last_command_batch_size = command_batch_size;
                 observability.max_command_batch_size =
                     observability.max_command_batch_size.max(command_batch_size);
+                let command_apply_started = Instant::now();
                 let command_effects = apply_runtime_commands(
                     commands,
                     &config,
@@ -198,6 +326,32 @@ pub async fn run() -> Result<()> {
                     now_utc,
                     &correlation_id,
                 ).await?;
+                observability
+                    .record_stage_latency("command_apply", elapsed_ms(command_apply_started));
+                if let Some(max_lag_ms) = command_effects.max_command_lag_ms {
+                    observability.last_command_lag_ms = Some(max_lag_ms);
+                    observability.max_command_lag_ms =
+                        observability.max_command_lag_ms.max(max_lag_ms);
+                    if max_lag_ms > command_lag_warn_ms {
+                        observability.command_lag_events += 1;
+                        let lag_event = WorkerStateEvent {
+                            tenant_id: config.tenant_id.clone(),
+                            exchange: config.exchange.clone(),
+                            product_id: config.product_id.clone(),
+                            state_type: "command_lag_detected".to_string(),
+                            payload: with_correlation_payload(
+                                json!({
+                                    "max_command_lag_ms": max_lag_ms,
+                                    "lagged_commands": command_effects.lagged_commands,
+                                    "threshold_ms": command_lag_warn_ms,
+                                }),
+                                &correlation_id,
+                            ),
+                            emitted_at_ts_ms: now_ms(),
+                        };
+                        publisher.publish(&lag_event).await?;
+                    }
+                }
 
                 if command_effects.reset_kernel {
                     execution
@@ -271,9 +425,13 @@ pub async fn run() -> Result<()> {
                     }
                 }
                 last_tick_event_ts_ms = Some(tick.event_ts_ms);
+                let execution_started = Instant::now();
                 execution.on_market_tick(&tick).await?;
+                observability.record_stage_latency("execution_on_tick", elapsed_ms(execution_started));
 
+                let kernel_started = Instant::now();
                 let output = kernel.on_tick(&tick)?;
+                observability.record_stage_latency("kernel_tick", elapsed_ms(kernel_started));
                 let output_stats = process_kernel_output(
                     output,
                     &mut *execution,
@@ -284,9 +442,12 @@ pub async fn run() -> Result<()> {
                 .await?;
                 observability.apply_kernel_output_stats(&output_stats);
 
+                let fill_flush_started = Instant::now();
                 let fills = execution
                     .flush_fills(&tick.tenant_id, &tick.exchange, &tick.product_id)
                     .await?;
+                observability.record_stage_latency("fill_flush", elapsed_ms(fill_flush_started));
+                let fill_process_started = Instant::now();
                 for fill in fills {
                     let out = kernel.on_fill(&fill);
                     let fill_stats = process_kernel_output(
@@ -301,10 +462,13 @@ pub async fn run() -> Result<()> {
                     total_fills += 1;
                     observability.fills_processed += 1;
                 }
+                observability.record_stage_latency("fill_process", elapsed_ms(fill_process_started));
 
+                let reconciliation_started = Instant::now();
                 let reconciliation = execution
                     .reconciliation_snapshot(&tick.tenant_id, &tick.exchange, &tick.product_id)
                     .await?;
+                observability.record_stage_latency("reconciliation", elapsed_ms(reconciliation_started));
                 let kernel_open_order_count = kernel.active_order_count();
                 if reconciliation.open_order_count != kernel_open_order_count {
                     observability.reconciliation_mismatches += 1;
@@ -329,6 +493,7 @@ pub async fn run() -> Result<()> {
 
                 let now_utc = Utc::now();
                 if scheduler.should_trigger(now_utc) {
+                    let daily_close_started = Instant::now();
                     if skip_next_daily_close {
                         skip_next_daily_close = false;
                         let skip_event = WorkerStateEvent {
@@ -382,9 +547,11 @@ pub async fn run() -> Result<()> {
 
                         scheduler.on_close_executed(now_utc)?;
                     }
+                    observability.record_stage_latency("daily_close", elapsed_ms(daily_close_started));
                 }
 
                 last_tick = Some(tick);
+                let state_publish_started = Instant::now();
                 publish_runtime_state(
                     &mut control_plane,
                     &config,
@@ -400,9 +567,43 @@ pub async fn run() -> Result<()> {
                     last_tick.as_ref(),
                     &observability,
                     market_data_gap_warn_ms,
+                    command_lag_warn_ms,
+                    heartbeat_lag_warn_ms,
                 )
                 .await?;
+                observability.record_stage_latency("state_publish", elapsed_ms(state_publish_started));
+                let heartbeat_publish_started = Instant::now();
                 control_plane.publish_heartbeat().await?;
+                observability.record_stage_latency(
+                    "heartbeat_publish",
+                    elapsed_ms(heartbeat_publish_started),
+                );
+                let heartbeat_ts_ms = now_ms();
+                let heartbeat_gap_ms = heartbeat_ts_ms - last_heartbeat_publish_ts_ms;
+                if heartbeat_gap_ms >= 0 {
+                    observability.last_heartbeat_gap_ms = Some(heartbeat_gap_ms);
+                    observability.max_heartbeat_gap_ms =
+                        observability.max_heartbeat_gap_ms.max(heartbeat_gap_ms);
+                    if heartbeat_gap_ms > heartbeat_lag_warn_ms {
+                        observability.heartbeat_lag_events += 1;
+                        let heartbeat_lag_event = WorkerStateEvent {
+                            tenant_id: config.tenant_id.clone(),
+                            exchange: config.exchange.clone(),
+                            product_id: config.product_id.clone(),
+                            state_type: "heartbeat_lag_detected".to_string(),
+                            payload: with_correlation_payload(
+                                json!({
+                                    "heartbeat_gap_ms": heartbeat_gap_ms,
+                                    "threshold_ms": heartbeat_lag_warn_ms,
+                                }),
+                                &correlation_id,
+                            ),
+                            emitted_at_ts_ms: heartbeat_ts_ms,
+                        };
+                        publisher.publish(&heartbeat_lag_event).await?;
+                    }
+                }
+                last_heartbeat_publish_ts_ms = heartbeat_ts_ms;
             }
         }
     }
@@ -510,10 +711,12 @@ async fn apply_runtime_commands(
                 product_id,
                 actor,
                 reset_type,
+                command_lag_ms,
             } => {
                 if !command_targets_product(&product_id, &config.product_id) {
                     continue;
                 }
+                effects.observe_command_lag(command_lag_ms);
 
                 if !allow_reset_command {
                     let event = WorkerStateEvent {
@@ -555,10 +758,12 @@ async fn apply_runtime_commands(
             RuntimeCommand::SkipDailyClose {
                 command_id,
                 product_id,
+                command_lag_ms,
             } => {
                 if !command_targets_product(&product_id, &config.product_id) {
                     continue;
                 }
+                effects.observe_command_lag(command_lag_ms);
 
                 *skip_next_daily_close = true;
                 let event = WorkerStateEvent {
@@ -583,10 +788,12 @@ async fn apply_runtime_commands(
                 daily_close_hour,
                 daily_close_minute,
                 mode,
+                command_lag_ms,
             } => {
                 if !command_targets_product(&product_id, &config.product_id) {
                     continue;
                 }
+                effects.observe_command_lag(command_lag_ms);
 
                 let schedule_mode = match parse_schedule_mode(&mode) {
                     Ok(v) => v,
@@ -695,9 +902,63 @@ async fn publish_runtime_state(
     last_tick: Option<&MarketTick>,
     observability: &RuntimeObservability,
     market_data_gap_warn_ms: i64,
+    command_lag_warn_ms: i64,
+    heartbeat_lag_warn_ms: i64,
 ) -> Result<()> {
     let now_utc = Utc::now();
     let uptime = (now_utc - started_at).num_seconds().max(0);
+
+    let latency_payload = json!({
+        "market_data_last": observability.last_market_data_latency_ms,
+        "market_data_max": observability.max_market_data_latency_ms,
+        "command_poll_last": observability.last_command_poll_latency_ms,
+        "command_poll_max": observability.max_command_poll_latency_ms,
+        "command_apply_last": observability.last_command_apply_latency_ms,
+        "command_apply_max": observability.max_command_apply_latency_ms,
+        "execution_on_tick_last": observability.last_execution_latency_ms,
+        "execution_on_tick_max": observability.max_execution_latency_ms,
+        "kernel_tick_last": observability.last_kernel_latency_ms,
+        "kernel_tick_max": observability.max_kernel_latency_ms,
+        "fill_flush_last": observability.last_fill_flush_latency_ms,
+        "fill_flush_max": observability.max_fill_flush_latency_ms,
+        "fill_process_last": observability.last_fill_process_latency_ms,
+        "fill_process_max": observability.max_fill_process_latency_ms,
+        "reconciliation_last": observability.last_reconciliation_latency_ms,
+        "reconciliation_max": observability.max_reconciliation_latency_ms,
+        "daily_close_last": observability.last_daily_close_latency_ms,
+        "daily_close_max": observability.max_daily_close_latency_ms,
+        "state_publish_last": observability.last_state_publish_latency_ms,
+        "state_publish_max": observability.max_state_publish_latency_ms,
+        "heartbeat_publish_last": observability.last_heartbeat_publish_latency_ms,
+        "heartbeat_publish_max": observability.max_heartbeat_publish_latency_ms,
+    });
+
+    let observability_payload = json!({
+        "ticks_processed": observability.ticks_processed,
+        "commands_processed": observability.commands_processed,
+        "last_command_batch_size": observability.last_command_batch_size,
+        "max_command_batch_size": observability.max_command_batch_size,
+        "orders_submitted": observability.orders_submitted,
+        "orders_canceled": observability.orders_canceled,
+        "liquidations_requested": observability.liquidations_requested,
+        "fills_processed": observability.fills_processed,
+        "kernel_events_published": observability.kernel_events_published,
+        "reconciliation_mismatches": observability.reconciliation_mismatches,
+        "market_data_gap_events": observability.market_data_gap_events,
+        "command_lag_events": observability.command_lag_events,
+        "heartbeat_lag_events": observability.heartbeat_lag_events,
+        "last_tick_gap_ms": observability.last_tick_gap_ms,
+        "max_tick_gap_ms": observability.max_tick_gap_ms,
+        "last_command_lag_ms": observability.last_command_lag_ms,
+        "max_command_lag_ms": observability.max_command_lag_ms,
+        "last_heartbeat_gap_ms": observability.last_heartbeat_gap_ms,
+        "max_heartbeat_gap_ms": observability.max_heartbeat_gap_ms,
+        "latency_ms": latency_payload,
+        "market_data_gap_warn_ms": market_data_gap_warn_ms,
+        "command_lag_warn_ms": command_lag_warn_ms,
+        "heartbeat_lag_warn_ms": heartbeat_lag_warn_ms,
+        "last_cycle_correlation_id": observability.last_cycle_correlation_id,
+    });
 
     let mut state = json!({
         "mode": mode,
@@ -717,23 +978,7 @@ async fn publish_runtime_state(
         "total_fills": total_fills,
         "open_order_count": kernel.active_order_count(),
         "reference_mid": kernel.reference_mid(),
-        "observability": {
-            "ticks_processed": observability.ticks_processed,
-            "commands_processed": observability.commands_processed,
-            "last_command_batch_size": observability.last_command_batch_size,
-            "max_command_batch_size": observability.max_command_batch_size,
-            "orders_submitted": observability.orders_submitted,
-            "orders_canceled": observability.orders_canceled,
-            "liquidations_requested": observability.liquidations_requested,
-            "fills_processed": observability.fills_processed,
-            "kernel_events_published": observability.kernel_events_published,
-            "reconciliation_mismatches": observability.reconciliation_mismatches,
-            "market_data_gap_events": observability.market_data_gap_events,
-            "last_tick_gap_ms": observability.last_tick_gap_ms,
-            "max_tick_gap_ms": observability.max_tick_gap_ms,
-            "market_data_gap_warn_ms": market_data_gap_warn_ms,
-            "last_cycle_correlation_id": observability.last_cycle_correlation_id,
-        },
+        "observability": observability_payload,
         "updated_at": now_utc.to_rfc3339(),
     });
 
@@ -843,6 +1088,15 @@ async fn process_kernel_output(
         stats.events_published += 1;
     }
     Ok(stats)
+}
+
+fn elapsed_ms(started: Instant) -> i64 {
+    started.elapsed().as_millis() as i64
+}
+
+fn update_latency_metric(last_ms: &mut i64, max_ms: &mut i64, current_ms: i64) {
+    *last_ms = current_ms.max(0);
+    *max_ms = (*max_ms).max(*last_ms);
 }
 
 fn now_ms() -> i64 {

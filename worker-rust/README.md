@@ -32,3 +32,6 @@ Este worker implementa el esqueleto de V4 con:
 - `TB_RESERVE_USD` (default `0`)
 - `TB_SESSION_CAPITAL_USD` (default `100`)
 - `TB_TICK_INTERVAL_MS` (default `1000`)
+- `TB_MARKET_DATA_GAP_WARN_MS` (threshold de alerta para `market_data_gap_detected`)
+- `TB_COMMAND_LAG_WARN_MS` (threshold de alerta para `command_lag_detected`)
+- `TB_HEARTBEAT_LAG_WARN_MS` (threshold de alerta para `heartbeat_lag_detected`)
