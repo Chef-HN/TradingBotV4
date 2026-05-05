@@ -93,7 +93,7 @@ pub async fn load_strategy_from_db(
                 session_capital_usd::float8 AS session_capital_usd,
                 paper_mode
             FROM tenant_pair_strategies
-            WHERE tenant_id = $1
+            WHERE tenant_id::text = $1
               AND exchange_name = $2
               AND product_id = $3
               AND is_active IS TRUE
