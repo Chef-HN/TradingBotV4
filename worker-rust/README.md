@@ -38,3 +38,24 @@ Este worker implementa el esqueleto de V4 con:
 - `TB_CHAOS_REDIS_FAIL_EVERY_N` (simula fallo de Redis cada N operaciones)
 - `TB_CHAOS_BYBIT_MARKET_FAIL_EVERY_N` (simula fallo de market data Bybit cada N requests)
 - `TB_CHAOS_BYBIT_EXEC_FAIL_EVERY_N` (simula fallo de ejecucion Bybit cada N llamadas API)
+
+## Smoke test de Chaos (staging V4 aislado)
+
+Script:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\phase3_chaos_smoke.ps1
+```
+
+Que valida:
+- Run A (`synthetic + live`): alertas `redis_*_failed`, alertas de `execution_*_failed`,
+  y thresholds de `market_data_gap_detected` / `heartbeat_lag_detected`.
+- Run B (`bybit_rest + simulator`): alerta `market_data_provider_error` con provider `bybit_rest`.
+
+Defaults del script (solo V4):
+- Postgres staging: `localhost:5443` / `tradingbotv4_staging`
+- Redis staging: `localhost:6390/15`
+- Contenedor Redis para flush: `tradingbotv4-staging-redis`
+
+Notas:
+- El script no toca V3.
+- Si una validacion falla, sale con codigo `1` y deja rutas de logs para diagnostico.
