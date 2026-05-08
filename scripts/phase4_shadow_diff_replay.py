@@ -105,6 +105,24 @@ def parse_args() -> argparse.Namespace:
         default=120,
         help="Timeout for Rust replay run.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["strict", "intent", "both"],
+        default="both",
+        help="Comparison mode: strict (order counts), intent (kernel decisions), or both.",
+    )
+    parser.add_argument(
+        "--strict-gate",
+        type=float,
+        default=0.80,
+        help="Informational gate threshold for strict_match_ratio.",
+    )
+    parser.add_argument(
+        "--intent-gate",
+        type=float,
+        default=0.95,
+        help="Informational gate threshold for intent_match_ratio.",
+    )
     return parser.parse_args()
 
 
@@ -506,8 +524,10 @@ def summarize_rust_cycles(events: list[dict[str, Any]]) -> list[CycleSummary]:
     return [by_cycle[k] for k in sorted(by_cycle)]
 
 
-def diff_summaries(
-    python_cycles: list[CycleSummary], rust_cycles: list[CycleSummary]
+def compare_cycles_by_fields(
+    python_cycles: list[CycleSummary],
+    rust_cycles: list[CycleSummary],
+    fields: list[str],
 ) -> dict[str, Any]:
     py_map = {x.cycle: x for x in python_cycles}
     rs_map = {x.cycle: x for x in rust_cycles}
@@ -531,12 +551,6 @@ def diff_summaries(
             kernel_rebalance_grid=0,
         )
 
-        fields = [
-            "order_submitted",
-            "order_canceled",
-            "kernel_bootstrap_grid",
-            "kernel_rebalance_grid",
-        ]
         deltas = {}
         for field in fields:
             py_val = getattr(py, field)
@@ -552,11 +566,39 @@ def diff_summaries(
     match_ratio = (match_cycles / compared_cycles) if compared_cycles else 1.0
 
     return {
+        "fields": fields,
         "compared_cycles": compared_cycles,
         "match_cycles": match_cycles,
         "divergence_cycles": divergence_cycles,
         "match_ratio": match_ratio,
         "divergences": divergence_rows,
+    }
+
+
+def diff_summaries(
+    python_cycles: list[CycleSummary],
+    rust_cycles: list[CycleSummary],
+    mode: str,
+) -> dict[str, Any]:
+    strict_fields = ["order_submitted", "order_canceled"]
+    intent_fields = ["kernel_bootstrap_grid", "kernel_rebalance_grid"]
+
+    strict = compare_cycles_by_fields(python_cycles, rust_cycles, strict_fields)
+    intent = compare_cycles_by_fields(python_cycles, rust_cycles, intent_fields)
+
+    if mode == "strict":
+        primary = strict
+    elif mode == "intent":
+        primary = intent
+    else:
+        # In both mode we default the primary summary to strict for backward readability.
+        primary = strict
+
+    return {
+        "mode": mode,
+        "primary": primary,
+        "strict": strict,
+        "intent": intent,
     }
 
 
@@ -570,51 +612,74 @@ def write_reports(
     rust_stderr: str,
     python_cycles: list[CycleSummary],
     rust_cycles: list[CycleSummary],
-    diff: dict[str, Any],
+    diff_bundle: dict[str, Any],
+    strict_gate: float,
+    intent_gate: float,
 ) -> tuple[Path, Path]:
     json_report = output_dir / f"shadow_diff_{timestamp}.json"
     md_report = output_dir / f"shadow_diff_{timestamp}.md"
 
+    strict = diff_bundle["strict"]
+    intent = diff_bundle["intent"]
+    primary = diff_bundle["primary"]
+    mode = diff_bundle["mode"]
+    strict_pass = strict["match_ratio"] >= strict_gate
+    intent_pass = intent["match_ratio"] >= intent_gate
+
     payload = {
         "generated_at_utc": datetime.now(tz=UTC).isoformat(),
         "replay_path": str(replay_path),
+        "mode": mode,
         "strategy": strategy_row,
         "rust_return_code": rust_return_code,
         "rust_stderr": rust_stderr,
         "python_cycles": [asdict(x) for x in python_cycles],
         "rust_cycles": [asdict(x) for x in rust_cycles],
-        "summary": {
-            "compared_cycles": diff["compared_cycles"],
-            "match_cycles": diff["match_cycles"],
-            "divergence_cycles": diff["divergence_cycles"],
-            "match_ratio": diff["match_ratio"],
+        "gates": {
+            "strict_gate": strict_gate,
+            "intent_gate": intent_gate,
+            "strict_pass": strict_pass,
+            "intent_pass": intent_pass,
         },
-        "divergences": diff["divergences"],
+        "summary": {
+            "primary": {
+                "compared_cycles": primary["compared_cycles"],
+                "match_cycles": primary["match_cycles"],
+                "divergence_cycles": primary["divergence_cycles"],
+                "match_ratio": primary["match_ratio"],
+                "fields": primary["fields"],
+            },
+            "strict": {
+                "compared_cycles": strict["compared_cycles"],
+                "match_cycles": strict["match_cycles"],
+                "divergence_cycles": strict["divergence_cycles"],
+                "match_ratio": strict["match_ratio"],
+                "fields": strict["fields"],
+            },
+            "intent": {
+                "compared_cycles": intent["compared_cycles"],
+                "match_cycles": intent["match_cycles"],
+                "divergence_cycles": intent["divergence_cycles"],
+                "match_ratio": intent["match_ratio"],
+                "fields": intent["fields"],
+            },
+        },
+        "divergences": {
+            "strict": strict["divergences"],
+            "intent": intent["divergences"],
+        },
     }
     json_report.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    top_divergences = diff["divergences"][:20]
-    lines = [
-        "# Phase 4 Shadow Diff Replay",
-        "",
-        f"- Generated (UTC): `{payload['generated_at_utc']}`",
-        f"- Replay: `{replay_path}`",
-        f"- Rust return code: `{rust_return_code}`",
-        "",
-        "## Summary",
-        "",
-        f"- Compared cycles: `{diff['compared_cycles']}`",
-        f"- Match cycles: `{diff['match_cycles']}`",
-        f"- Divergence cycles: `{diff['divergence_cycles']}`",
-        f"- Match ratio: `{diff['match_ratio']:.4f}`",
-        "",
-        "## Top Divergences (first 20)",
-        "",
-    ]
-    if not top_divergences:
-        lines.append("- No divergences detected.")
-    else:
-        for row in top_divergences:
+    top_primary_divergences = primary["divergences"][:20]
+    top_strict_divergences = strict["divergences"][:10]
+    top_intent_divergences = intent["divergences"][:10]
+
+    def append_divergence_lines(lines: list[str], rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            lines.append("- No divergences detected.")
+            return
+        for row in rows:
             lines.append(f"- Cycle `{row['cycle']}`: `{row['reason']}`")
             if row["reason"] == "value_diff":
                 lines.append(f"  - Diff: `{json.dumps(row['diff'], separators=(',', ':'))}`")
@@ -625,6 +690,59 @@ def write_reports(
                 lines.append(
                     f"  - Rust: `{json.dumps(row.get('rust'), separators=(',', ':'))}`"
                 )
+
+    lines = [
+        "# Phase 4 Shadow Diff Replay",
+        "",
+        f"- Generated (UTC): `{payload['generated_at_utc']}`",
+        f"- Replay: `{replay_path}`",
+        f"- Rust return code: `{rust_return_code}`",
+        f"- Mode: `{mode}`",
+        "",
+        "## Summary (Primary)",
+        "",
+        f"- Compared cycles: `{primary['compared_cycles']}`",
+        f"- Match cycles: `{primary['match_cycles']}`",
+        f"- Divergence cycles: `{primary['divergence_cycles']}`",
+        f"- Match ratio: `{primary['match_ratio']:.4f}`",
+        f"- Fields: `{','.join(primary['fields'])}`",
+        "",
+        "## Summary (Strict)",
+        "",
+        f"- Compared cycles: `{strict['compared_cycles']}`",
+        f"- Match cycles: `{strict['match_cycles']}`",
+        f"- Divergence cycles: `{strict['divergence_cycles']}`",
+        f"- Match ratio: `{strict['match_ratio']:.4f}`",
+        f"- Gate (`{strict_gate:.2f}`): `{'PASS' if strict_pass else 'FAIL'}`",
+        "",
+        "## Summary (Intent)",
+        "",
+        f"- Compared cycles: `{intent['compared_cycles']}`",
+        f"- Match cycles: `{intent['match_cycles']}`",
+        f"- Divergence cycles: `{intent['divergence_cycles']}`",
+        f"- Match ratio: `{intent['match_ratio']:.4f}`",
+        f"- Gate (`{intent_gate:.2f}`): `{'PASS' if intent_pass else 'FAIL'}`",
+        "",
+        "## Top Divergences (Primary, first 20)",
+        "",
+    ]
+    append_divergence_lines(lines, top_primary_divergences)
+    lines.extend(
+        [
+            "",
+            "## Top Divergences (Strict, first 10)",
+            "",
+        ]
+    )
+    append_divergence_lines(lines, top_strict_divergences)
+    lines.extend(
+        [
+            "",
+            "## Top Divergences (Intent, first 10)",
+            "",
+        ]
+    )
+    append_divergence_lines(lines, top_intent_divergences)
 
     md_report.write_text("\n".join(lines), encoding="utf-8")
     return json_report, md_report
@@ -680,7 +798,7 @@ async def main() -> int:
 
     rust_cycles = summarize_rust_cycles(rust_events)
     python_cycles = summarize_python_cycles(strategy_row, ticks)
-    diff = diff_summaries(python_cycles, rust_cycles)
+    diff_bundle = diff_summaries(python_cycles, rust_cycles, args.mode)
 
     json_report, md_report = write_reports(
         output_dir=output_dir,
@@ -691,19 +809,46 @@ async def main() -> int:
         rust_stderr=rust_stderr,
         python_cycles=python_cycles,
         rust_cycles=rust_cycles,
-        diff=diff,
+        diff_bundle=diff_bundle,
+        strict_gate=args.strict_gate,
+        intent_gate=args.intent_gate,
     )
+
+    strict = diff_bundle["strict"]
+    intent = diff_bundle["intent"]
+    primary = diff_bundle["primary"]
 
     print("Shadow diff replay completed.")
     print(f"Replay: {replay_path}")
     print(f"JSON report: {json_report}")
     print(f"Markdown report: {md_report}")
     print(
-        "Summary: compared={compared} match={match} divergence={div} ratio={ratio:.4f}".format(
-            compared=diff["compared_cycles"],
-            match=diff["match_cycles"],
-            div=diff["divergence_cycles"],
-            ratio=diff["match_ratio"],
+        "Primary summary ({mode}): compared={compared} match={match} divergence={div} ratio={ratio:.4f}".format(
+            mode=args.mode,
+            compared=primary["compared_cycles"],
+            match=primary["match_cycles"],
+            div=primary["divergence_cycles"],
+            ratio=primary["match_ratio"],
+        )
+    )
+    print(
+        "Strict summary: compared={compared} match={match} divergence={div} ratio={ratio:.4f} gate={gate:.2f} ({status})".format(
+            compared=strict["compared_cycles"],
+            match=strict["match_cycles"],
+            div=strict["divergence_cycles"],
+            ratio=strict["match_ratio"],
+            gate=args.strict_gate,
+            status="PASS" if strict["match_ratio"] >= args.strict_gate else "FAIL",
+        )
+    )
+    print(
+        "Intent summary: compared={compared} match={match} divergence={div} ratio={ratio:.4f} gate={gate:.2f} ({status})".format(
+            compared=intent["compared_cycles"],
+            match=intent["match_cycles"],
+            div=intent["divergence_cycles"],
+            ratio=intent["match_ratio"],
+            gate=args.intent_gate,
+            status="PASS" if intent["match_ratio"] >= args.intent_gate else "FAIL",
         )
     )
     return 0

@@ -67,6 +67,11 @@ Script:
 .\.venv\Scripts\python.exe .\scripts\phase4_shadow_diff_replay.py
 ```
 
+Modo dual recomendado:
+```powershell
+.\.venv\Scripts\python.exe .\scripts\phase4_shadow_diff_replay.py --mode both
+```
+
 Salida:
 - genera replay (si no se pasa `--replay-path`)
 - ejecuta worker Rust en modo `replay + simulator`
@@ -74,3 +79,9 @@ Salida:
 - produce reporte de divergencias por ciclo:
   - `logs/phase4_shadow/shadow_diff_<timestamp>.json`
   - `logs/phase4_shadow/shadow_diff_<timestamp>.md`
+- resumen dual:
+  - `strict` -> paridad de `order_submitted` / `order_canceled`
+  - `intent` -> paridad de `kernel_bootstrap_grid` / `kernel_rebalance_grid`
+- gates informativos (ajustables):
+  - `--strict-gate` (default `0.80`)
+  - `--intent-gate` (default `0.95`)
