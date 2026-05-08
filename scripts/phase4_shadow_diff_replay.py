@@ -123,6 +123,17 @@ def parse_args() -> argparse.Namespace:
         default=0.95,
         help="Informational gate threshold for intent_match_ratio.",
     )
+    parser.add_argument(
+        "--enforce-gates",
+        action="store_true",
+        help="Return non-zero exit code when selected gate scope does not pass.",
+    )
+    parser.add_argument(
+        "--gate-scope",
+        choices=["strict", "intent", "both"],
+        default="intent",
+        help="Which gate scope to enforce when --enforce-gates is set.",
+    )
     return parser.parse_args()
 
 
@@ -615,6 +626,8 @@ def write_reports(
     diff_bundle: dict[str, Any],
     strict_gate: float,
     intent_gate: float,
+    gate_scope: str,
+    enforce_gates: bool,
 ) -> tuple[Path, Path]:
     json_report = output_dir / f"shadow_diff_{timestamp}.json"
     md_report = output_dir / f"shadow_diff_{timestamp}.md"
@@ -630,6 +643,8 @@ def write_reports(
         "generated_at_utc": datetime.now(tz=UTC).isoformat(),
         "replay_path": str(replay_path),
         "mode": mode,
+        "gate_scope": gate_scope,
+        "enforce_gates": enforce_gates,
         "strategy": strategy_row,
         "rust_return_code": rust_return_code,
         "rust_stderr": rust_stderr,
@@ -640,6 +655,8 @@ def write_reports(
             "intent_gate": intent_gate,
             "strict_pass": strict_pass,
             "intent_pass": intent_pass,
+            "gate_scope": gate_scope,
+            "enforced": enforce_gates,
         },
         "summary": {
             "primary": {
@@ -698,6 +715,8 @@ def write_reports(
         f"- Replay: `{replay_path}`",
         f"- Rust return code: `{rust_return_code}`",
         f"- Mode: `{mode}`",
+        f"- Gate Scope: `{gate_scope}`",
+        f"- Enforce Gates: `{enforce_gates}`",
         "",
         "## Summary (Primary)",
         "",
@@ -812,6 +831,8 @@ async def main() -> int:
         diff_bundle=diff_bundle,
         strict_gate=args.strict_gate,
         intent_gate=args.intent_gate,
+        gate_scope=args.gate_scope,
+        enforce_gates=args.enforce_gates,
     )
 
     strict = diff_bundle["strict"]
@@ -851,6 +872,25 @@ async def main() -> int:
             status="PASS" if intent["match_ratio"] >= args.intent_gate else "FAIL",
         )
     )
+
+    strict_pass = strict["match_ratio"] >= args.strict_gate
+    intent_pass = intent["match_ratio"] >= args.intent_gate
+    if args.enforce_gates:
+        if args.gate_scope == "strict":
+            gate_ok = strict_pass
+        elif args.gate_scope == "intent":
+            gate_ok = intent_pass
+        else:
+            gate_ok = strict_pass and intent_pass
+        if not gate_ok:
+            print(
+                "Gate enforcement failed: scope={scope} strict_pass={strict_pass} intent_pass={intent_pass}".format(
+                    scope=args.gate_scope,
+                    strict_pass=strict_pass,
+                    intent_pass=intent_pass,
+                )
+            )
+            return 2
     return 0
 
 

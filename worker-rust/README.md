@@ -72,6 +72,11 @@ Modo dual recomendado:
 .\.venv\Scripts\python.exe .\scripts\phase4_shadow_diff_replay.py --mode both
 ```
 
+Replay baseline fijo (v1):
+```powershell
+.\.venv\Scripts\python.exe .\scripts\phase4_shadow_diff_replay.py --mode both --replay-path .\replay\fixtures\solusd_shadow_baseline_v1_20260508.jsonl
+```
+
 Salida:
 - genera replay (si no se pasa `--replay-path`)
 - ejecuta worker Rust en modo `replay + simulator`
@@ -85,3 +90,6 @@ Salida:
 - gates informativos (ajustables):
   - `--strict-gate` (default `0.80`)
   - `--intent-gate` (default `0.95`)
+- enforce opcional:
+  - `--enforce-gates --gate-scope intent` (recomendado para Fase 4 actual)
+  - `--enforce-gates --gate-scope both` (estricto)
