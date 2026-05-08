@@ -59,3 +59,18 @@ Defaults del script (solo V4):
 Notas:
 - El script no toca V3.
 - Si una validacion falla, sale con codigo `1` y deja rutas de logs para diagnostico.
+
+## Shadow Diff Replay (Fase 4 - Bloque 1)
+
+Script:
+```powershell
+.\.venv\Scripts\python.exe .\scripts\phase4_shadow_diff_replay.py
+```
+
+Salida:
+- genera replay (si no se pasa `--replay-path`)
+- ejecuta worker Rust en modo `replay + simulator`
+- evalua kernel Python sobre el mismo stream
+- produce reporte de divergencias por ciclo:
+  - `logs/phase4_shadow/shadow_diff_<timestamp>.json`
+  - `logs/phase4_shadow/shadow_diff_<timestamp>.md`
