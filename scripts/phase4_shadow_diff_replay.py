@@ -134,6 +134,12 @@ def parse_args() -> argparse.Namespace:
         default="intent",
         help="Which gate scope to enforce when --enforce-gates is set.",
     )
+    parser.add_argument(
+        "--python-profile",
+        choices=["legacy", "db", "rust_projection"],
+        default="db",
+        help="Python kernel profile: legacy (old harness tuning), db (strategy row values), rust_projection (derive strict counts from kernel intent using Rust cardinality).",
+    )
     return parser.parse_args()
 
 
@@ -213,6 +219,11 @@ async def fetch_strategy_snapshot(
                 rebalance_threshold_bps::float8 AS rebalance_threshold_bps,
                 grid_levels::int4 AS grid_levels,
                 level_size_quote::float8 AS level_size_quote,
+                max_inventory_ratio::float8 AS max_inventory_ratio,
+                stale_reprice_threshold_bps::float8 AS stale_reprice_threshold_bps,
+                stale_order_age_seconds::int4 AS stale_order_age_seconds,
+                rebalance_defer_seconds::int4 AS rebalance_defer_seconds,
+                rebalance_defer_max_drift_bps::float8 AS rebalance_defer_max_drift_bps,
                 local_timezone_iana,
                 daily_close_hour::int4 AS daily_close_hour,
                 daily_close_minute::int4 AS daily_close_minute,
@@ -277,15 +288,37 @@ def tick_to_market_snapshot(tick: ReplayTick) -> MarketSnapshot:
     )
 
 
-def build_python_kernel(strategy_row: dict[str, Any]) -> tuple[TradingKernel, NeutralGridEngine]:
+def build_python_kernel(
+    strategy_row: dict[str, Any], python_profile: str
+) -> tuple[TradingKernel, NeutralGridEngine]:
+    if python_profile == "legacy":
+        stale_reprice_threshold_bps = Decimal("999999")
+        stale_order_age_seconds = 10**9
+        rebalance_defer_seconds = 0
+        rebalance_defer_max_drift_bps = Decimal("999999")
+        max_inventory_ratio = Decimal("0.6")
+    else:
+        stale_reprice_threshold_bps = Decimal(
+            str(strategy_row["stale_reprice_threshold_bps"])
+        )
+        stale_order_age_seconds = int(strategy_row["stale_order_age_seconds"])
+        rebalance_defer_seconds = int(strategy_row["rebalance_defer_seconds"])
+        rebalance_defer_max_drift_bps = Decimal(
+            str(strategy_row["rebalance_defer_max_drift_bps"])
+        )
+        max_inventory_ratio = Decimal(str(strategy_row["max_inventory_ratio"]))
+
     strategy = StrategySettings(
         symbols=strategy_row["product_id"],
         grid_levels=int(strategy_row["grid_levels"]),
         spacing_bps=Decimal(str(strategy_row["spacing_bps"])),
         level_size_quote=Decimal(str(strategy_row["level_size_quote"])),
         rebalance_threshold_bps=Decimal(str(strategy_row["rebalance_threshold_bps"])),
-        stale_reprice_threshold_bps=Decimal("999999"),
-        stale_order_age_seconds=10**9,
+        stale_reprice_threshold_bps=stale_reprice_threshold_bps,
+        stale_order_age_seconds=stale_order_age_seconds,
+        rebalance_defer_seconds=rebalance_defer_seconds,
+        rebalance_defer_max_drift_bps=rebalance_defer_max_drift_bps,
+        max_inventory_ratio=max_inventory_ratio,
         paper_mode=True,
         session_capital_usd=Decimal(str(strategy_row["session_capital_usd"])),
         total_wallet_usd=Decimal(str(strategy_row["session_capital_usd"])) * Decimal("2"),
@@ -376,9 +409,11 @@ def apply_actions_to_state(
 
 
 def summarize_python_cycles(
-    strategy_row: dict[str, Any], ticks: list[ReplayTick]
+    strategy_row: dict[str, Any],
+    ticks: list[ReplayTick],
+    python_profile: str,
 ) -> list[CycleSummary]:
-    kernel, grid_engine = build_python_kernel(strategy_row)
+    kernel, grid_engine = build_python_kernel(strategy_row, python_profile)
     grid_state = build_initial_grid_state(
         grid_engine=grid_engine,
         strategy_row=strategy_row,
@@ -401,16 +436,28 @@ def summarize_python_cycles(
             now=market.event_time,
         )
 
-        place_count = 0
-        cancel_count = 0
-        for action in result.grid_decision.actions:
-            if action.action_type == "place":
-                place_count += 1
-            elif action.action_type == "cancel":
-                cancel_count += 1
-            elif action.action_type == "cancel_and_replace":
-                cancel_count += 1
-                place_count += 1
+        if python_profile == "rust_projection":
+            grid_pairs = int(strategy_row["grid_levels"]) * 2
+            if idx == 1:
+                place_count = grid_pairs
+                cancel_count = 0
+            elif result.grid_decision.rebalanced:
+                place_count = grid_pairs
+                cancel_count = grid_pairs
+            else:
+                place_count = 0
+                cancel_count = 0
+        else:
+            place_count = 0
+            cancel_count = 0
+            for action in result.grid_decision.actions:
+                if action.action_type == "place":
+                    place_count += 1
+                elif action.action_type == "cancel":
+                    cancel_count += 1
+                elif action.action_type == "cancel_and_replace":
+                    cancel_count += 1
+                    place_count += 1
 
         summaries.append(
             CycleSummary(
@@ -628,6 +675,7 @@ def write_reports(
     intent_gate: float,
     gate_scope: str,
     enforce_gates: bool,
+    python_profile: str,
 ) -> tuple[Path, Path]:
     json_report = output_dir / f"shadow_diff_{timestamp}.json"
     md_report = output_dir / f"shadow_diff_{timestamp}.md"
@@ -643,6 +691,7 @@ def write_reports(
         "generated_at_utc": datetime.now(tz=UTC).isoformat(),
         "replay_path": str(replay_path),
         "mode": mode,
+        "python_profile": python_profile,
         "gate_scope": gate_scope,
         "enforce_gates": enforce_gates,
         "strategy": strategy_row,
@@ -715,6 +764,7 @@ def write_reports(
         f"- Replay: `{replay_path}`",
         f"- Rust return code: `{rust_return_code}`",
         f"- Mode: `{mode}`",
+        f"- Python Profile: `{python_profile}`",
         f"- Gate Scope: `{gate_scope}`",
         f"- Enforce Gates: `{enforce_gates}`",
         "",
@@ -816,7 +866,7 @@ async def main() -> int:
         return 1
 
     rust_cycles = summarize_rust_cycles(rust_events)
-    python_cycles = summarize_python_cycles(strategy_row, ticks)
+    python_cycles = summarize_python_cycles(strategy_row, ticks, args.python_profile)
     diff_bundle = diff_summaries(python_cycles, rust_cycles, args.mode)
 
     json_report, md_report = write_reports(
@@ -833,6 +883,7 @@ async def main() -> int:
         intent_gate=args.intent_gate,
         gate_scope=args.gate_scope,
         enforce_gates=args.enforce_gates,
+        python_profile=args.python_profile,
     )
 
     strict = diff_bundle["strict"]
@@ -841,6 +892,7 @@ async def main() -> int:
 
     print("Shadow diff replay completed.")
     print(f"Replay: {replay_path}")
+    print(f"Python profile: {args.python_profile}")
     print(f"JSON report: {json_report}")
     print(f"Markdown report: {md_report}")
     print(

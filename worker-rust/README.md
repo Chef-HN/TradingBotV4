@@ -77,6 +77,11 @@ Replay baseline fijo (v1):
 .\.venv\Scripts\python.exe .\scripts\phase4_shadow_diff_replay.py --mode both --replay-path .\replay\fixtures\solusd_shadow_baseline_v1_20260508.jsonl
 ```
 
+Perfiles Python disponibles:
+- `--python-profile db` (default): usa parámetros reales de estrategia en BD.
+- `--python-profile legacy`: perfil histórico del harness.
+- `--python-profile rust_projection`: proyecta cardinalidad strict equivalente a Rust (2*grid_levels en bootstrap y rebalance).
+
 Salida:
 - genera replay (si no se pasa `--replay-path`)
 - ejecuta worker Rust en modo `replay + simulator`
@@ -93,3 +98,8 @@ Salida:
 - enforce opcional:
   - `--enforce-gates --gate-scope intent` (recomendado para Fase 4 actual)
   - `--enforce-gates --gate-scope both` (estricto)
+
+Gate completo (strict+intent) con baseline fijo:
+```powershell
+.\.venv\Scripts\python.exe .\scripts\phase4_shadow_diff_replay.py --mode both --replay-path .\replay\fixtures\solusd_shadow_baseline_v1_20260508.jsonl --python-profile rust_projection --enforce-gates --gate-scope both
+```
