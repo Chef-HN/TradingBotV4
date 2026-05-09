@@ -1,0 +1,105 @@
+name: Phase4 Shadow Gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, master]
+    paths:
+      - ".github/workflows/phase4-shadow-gate.yml"
+      - "scripts/phase4_shadow_diff_replay.py"
+      - "worker-rust/**"
+      - "src/**"
+      - "migrations/**"
+      - "replay/fixtures/solusd_shadow_baseline_v1_20260508.jsonl"
+  push:
+    branches: [main, master]
+    paths:
+      - ".github/workflows/phase4-shadow-gate.yml"
+      - "scripts/phase4_shadow_diff_replay.py"
+      - "worker-rust/**"
+      - "src/**"
+      - "migrations/**"
+      - "replay/fixtures/solusd_shadow_baseline_v1_20260508.jsonl"
+
+jobs:
+  shadow-diff-baseline:
+    name: Shadow Diff Baseline Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: tradingbotv4_staging
+          POSTGRES_USER: tradingbot
+          POSTGRES_PASSWORD: tradingbot
+        ports:
+          - 5443:5432
+        options: >-
+          --health-cmd "pg_isready -U tradingbot -d tradingbotv4_staging"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6390:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: worker-rust
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      - name: Apply DB migrations (V4 staging schema)
+        env:
+          DB_HOST: 127.0.0.1
+          DB_PORT: "5443"
+          DB_NAME: tradingbotv4_staging
+          DB_USER: tradingbot
+          DB_PASSWORD: tradingbot
+        run: |
+          python -m scripts.init_db
+
+      - name: Run Phase 4 baseline shadow gate (strict + intent)
+        env:
+          TB_DB_DSN: postgresql://tradingbot:tradingbot@127.0.0.1:5443/tradingbotv4_staging
+          TB_REDIS_URL: redis://127.0.0.1:6390/15
+        run: |
+          python scripts/phase4_shadow_diff_replay.py \
+            --mode both \
+            --replay-path replay/fixtures/solusd_shadow_baseline_v1_20260508.jsonl \
+            --python-profile rust_projection \
+            --db-dsn "$TB_DB_DSN" \
+            --redis-url "$TB_REDIS_URL" \
+            --enforce-gates \
+            --gate-scope both
+
+      - name: Upload shadow diff artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase4-shadow-gate-artifacts
+          path: logs/phase4_shadow/
+          if-no-files-found: warn
