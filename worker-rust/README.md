@@ -103,3 +103,31 @@ Gate completo (strict+intent) con baseline fijo:
 ```powershell
 .\.venv\Scripts\python.exe .\scripts\phase4_shadow_diff_replay.py --mode both --replay-path .\replay\fixtures\solusd_shadow_baseline_v1_20260508.jsonl --python-profile rust_projection --enforce-gates --gate-scope both
 ```
+
+## Canary Smoke (Fase 4 - Bloque 6)
+
+Script:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\phase4_canary_smoke.ps1
+```
+
+Que valida:
+- Worker V4 emite `worker_boot` y `kernel_bootstrap_grid`.
+- Se observan ciclos reales (`correlation_id` de ciclo) y `order_submitted` minimo.
+- No aparecen fallos criticos (`redis_*_failed`, `execution_*_failed`, `market_data_provider_error`, `execution_reconciliation_*`).
+- No aparecen alertas de lag/gap por encima del budget configurado.
+
+Defaults del script (solo V4):
+- Postgres staging: `localhost:5443` / `tradingbotv4_staging`
+- Redis staging: `localhost:6390/15`
+- Modo: `simulator`
+- Provider: `synthetic`
+
+Opcional (si quieres fallback automatico documentado al fallar):
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\phase4_canary_smoke.ps1 -AutoRollbackOnFail
+```
+
+Notas:
+- El script no toca V3.
+- Si falla, sale con codigo `1` y deja logs en `logs/phase4_canary/`.
