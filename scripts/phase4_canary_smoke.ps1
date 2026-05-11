@@ -21,6 +21,7 @@ param(
     [int]$MaxAllowedGapAlerts = 0,
     [int]$MaxAllowedHeartbeatAlerts = 0,
     [int]$MaxAllowedCommandLagAlerts = 0,
+    [switch]$SkipBybitPreflight,
     [switch]$AutoRollbackOnFail
 )
 
@@ -125,10 +126,37 @@ function Count-State {
     return @($Events | Where-Object { $_.state_type -eq $StateType }).Count
 }
 
+function Test-BybitConnectivity {
+    param(
+        [string]$Url,
+        [int]$TimeoutSeconds = 10
+    )
+
+    try {
+        $resp = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec $TimeoutSeconds -Method Get
+        return ($null -ne $resp -and $resp.StatusCode -ge 200 -and $resp.StatusCode -lt 500)
+    }
+    catch {
+        return $false
+    }
+}
+
 Write-Info "Phase4 canary smoke iniciado (solo V4)."
 Write-Info "RepoRoot=$RepoRoot"
 Write-Info "WorkerRustDir=$WorkerRustDir"
 Write-Info "DB/Redis V4: $DbDsn | $RedisUrl"
+
+if ($MarketDataProvider -eq "bybit_rest" -and -not $SkipBybitPreflight) {
+    $bybitUrl = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=SOLUSDT"
+    Write-Info "Preflight bybit_rest: comprobando conectividad a $bybitUrl"
+    if (-not (Test-BybitConnectivity -Url $bybitUrl -TimeoutSeconds 10)) {
+        Write-Host ""
+        Write-Host "CANARY SMOKE: FAIL" -ForegroundColor Red
+        Write-Host "- Preflight fallo: sin conectividad HTTP hacia api.bybit.com."
+        Write-Host "- No se ejecuta canary bybit_rest hasta resolver egress DNS/red/firewall."
+        exit 2
+    }
+}
 
 $envVars = @{
     TB_DB_DSN = $DbDsn

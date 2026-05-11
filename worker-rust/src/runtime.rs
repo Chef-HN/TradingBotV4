@@ -463,7 +463,7 @@ pub async fn run() -> Result<()> {
                             payload: with_correlation_payload(
                                 json!({
                                     "market_data_provider": market_data_provider_name.as_str(),
-                                    "error": err.to_string(),
+                                    "error": format!("{err:#}"),
                                 }),
                                 &correlation_id,
                             ),

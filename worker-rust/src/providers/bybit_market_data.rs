@@ -68,21 +68,32 @@ impl BybitRestMarketDataProvider {
         let url = format!("{}/v5/market/tickers", self.base_url);
         let response = self
             .client
-            .get(url)
+            .get(&url)
             .query(&[
                 ("category", self.category.as_str()),
                 ("symbol", self.symbol.as_str()),
             ])
             .send()
             .await
-            .with_context(|| {
-                format!(
-                    "bybit request failed category={} symbol={}",
-                    self.category, self.symbol
+            .map_err(|err| {
+                anyhow!(
+                    "bybit request failed category={} symbol={} url={}: {:#}",
+                    self.category,
+                    self.symbol,
+                    url,
+                    err
                 )
             })?
             .error_for_status()
-            .context("bybit returned non-success status")?;
+            .map_err(|err| {
+                anyhow!(
+                    "bybit returned non-success status category={} symbol={} url={}: {:#}",
+                    self.category,
+                    self.symbol,
+                    url,
+                    err
+                )
+            })?;
 
         let body: BybitTickerResponse = response
             .json()

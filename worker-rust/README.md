@@ -128,6 +128,11 @@ Opcional (si quieres fallback automatico documentado al fallar):
 powershell -ExecutionPolicy Bypass -File .\scripts\phase4_canary_smoke.ps1 -AutoRollbackOnFail
 ```
 
+Nota para `bybit_rest`:
+- El script ejecuta preflight HTTP a `api.bybit.com` antes del canary.
+- Si el entorno no tiene salida de red, falla rapido con codigo `2`.
+- Para forzar la corrida sin preflight (diagnostico), usar `-SkipBybitPreflight`.
+
 Notas:
 - El script no toca V3.
 - Si falla, sale con codigo `1` y deja logs en `logs/phase4_canary/`.
