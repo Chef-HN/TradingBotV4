@@ -122,6 +122,9 @@ Defaults del script (solo V4):
 - Redis staging: `localhost:6390/15`
 - Modo: `simulator`
 - Provider: `synthetic`
+- `MinCycles` dinamico:
+  - `synthetic`: `5`
+  - `bybit_rest`: `1` (ventanas estables pueden no generar muchos eventos)
 
 Opcional (si quieres fallback automatico documentado al fallar):
 ```powershell
@@ -132,6 +135,10 @@ Nota para `bybit_rest`:
 - El script ejecuta preflight HTTP a `api.bybit.com` antes del canary.
 - Si el entorno no tiene salida de red, falla rapido con codigo `2`.
 - Para forzar la corrida sin preflight (diagnostico), usar `-SkipBybitPreflight`.
+- Diagnostico extendido de egress:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\phase4_bybit_egress_diagnostic.ps1
+```
 
 Notas:
 - El script no toca V3.

@@ -16,7 +16,7 @@ param(
     [int]$HeartbeatLagWarnMs = 5000,
     [int]$CommandLagWarnMs = 5000,
     [int]$MinOrderSubmitted = 2,
-    [int]$MinCycles = 5,
+    [int]$MinCycles = -1,
     [int]$MaxAllowedFailures = 0,
     [int]$MaxAllowedGapAlerts = 0,
     [int]$MaxAllowedHeartbeatAlerts = 0,
@@ -94,10 +94,17 @@ function Run-WorkerWindow {
     }
 
     $process = $null
+    $exitedBeforeWindow = $false
+    $exitCode = $null
     try {
         Write-Info "Iniciando canary por $Seconds s (provider=$MarketDataProvider mode=$ExecutionMode)..."
         $process = Start-Process cargo -ArgumentList @("run", "--quiet") -PassThru -WindowStyle Hidden -WorkingDirectory $WorkerRustDir -RedirectStandardOutput $stdout -RedirectStandardError $stderr
         Start-Sleep -Seconds $Seconds
+        if ($null -ne $process -and $process.HasExited) {
+            $exitedBeforeWindow = $true
+            $exitCode = $process.ExitCode
+            Write-Info "Canary finalizo antes de tiempo (ExitCode=$exitCode)."
+        }
     }
     finally {
         if ($null -ne $process -and -not $process.HasExited) {
@@ -115,6 +122,8 @@ function Run-WorkerWindow {
         Stdout = $stdout
         Stderr = $stderr
         Events = $events
+        ExitedBeforeWindow = $exitedBeforeWindow
+        ExitCode = $exitCode
     }
 }
 
@@ -179,6 +188,17 @@ $run = Run-WorkerWindow -EnvVars $envVars -Seconds $DurationSeconds
 $events = $run.Events
 $counts = $events | Group-Object state_type | Sort-Object Count -Descending
 
+$requiredMinCycles = $MinCycles
+if ($requiredMinCycles -lt 0) {
+    if ($MarketDataProvider -eq "bybit_rest") {
+        # Bybit can have low event density in stable windows.
+        $requiredMinCycles = 1
+    }
+    else {
+        $requiredMinCycles = 5
+    }
+}
+
 Write-Info "Resumen de eventos: total=$($events.Count)"
 foreach ($g in $counts) {
     Write-Host ("  {0,4}  {1}" -f $g.Count, $g.Name)
@@ -225,8 +245,11 @@ if ($bootstrapCount -lt 1) {
 if ($orderSubmitted -lt $MinOrderSubmitted) {
     $errors.Add("order_submitted=$orderSubmitted por debajo del minimo esperado ($MinOrderSubmitted).")
 }
-if ($cycleIds.Count -lt $MinCycles) {
-    $errors.Add("Ciclos observados=$($cycleIds.Count) por debajo del minimo esperado ($MinCycles).")
+if ($cycleIds.Count -lt $requiredMinCycles) {
+    $errors.Add("Ciclos observados=$($cycleIds.Count) por debajo del minimo esperado ($requiredMinCycles).")
+}
+if ($run.ExitedBeforeWindow) {
+    $errors.Add("El worker finalizo antes de completar la ventana (ExitCode=$($run.ExitCode)).")
 }
 if ($failureCount -gt $MaxAllowedFailures) {
     $errors.Add("Eventos de fallo=$failureCount exceden maximo permitido=$MaxAllowedFailures.")
@@ -282,7 +305,7 @@ Write-Host "CANARY SMOKE: PASS" -ForegroundColor Green
 Write-Host "Validaciones OK:"
 Write-Host "- worker_boot y kernel_bootstrap_grid presentes."
 Write-Host "- order_submitted >= $MinOrderSubmitted."
-Write-Host "- ciclos observados >= $MinCycles."
+Write-Host "- ciclos observados >= $requiredMinCycles."
 Write-Host "- sin eventos de fallo y sin alertas por encima de umbral."
 Write-Host ""
 Write-Host "Logs:"
