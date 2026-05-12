@@ -82,6 +82,16 @@ jobs:
         run: |
           python -m scripts.init_db
 
+      - name: Seed shadow strategy row (tenant pair, SOL-USD)
+        env:
+          TB_DB_DSN: postgresql://tradingbot:tradingbot@127.0.0.1:5443/tradingbotv4_staging
+        run: |
+          python scripts/phase4_seed_shadow_strategy.py \
+            --db-dsn "$TB_DB_DSN" \
+            --tenant-id "00000000-0000-0000-0000-000000000001" \
+            --exchange "bybit" \
+            --product-id "SOL-USD"
+
       - name: Run Phase 4 baseline shadow gate (strict + intent)
         env:
           TB_DB_DSN: postgresql://tradingbot:tradingbot@127.0.0.1:5443/tradingbotv4_staging
