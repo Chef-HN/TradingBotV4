@@ -2,13 +2,14 @@ param(
     [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$WorkerRustDir = "",
     [string]$DbDsn = "postgresql://tradingbot:tradingbot@localhost:5443/tradingbotv4_staging",
+    [string]$MarketDataDbDsn = "postgresql://tradingbot:tradingbot@localhost:5433/tradingbotv3",
     [string]$RedisUrl = "redis://localhost:6390/15",
     [string]$TenantId = "00000000-0000-0000-0000-000000000001",
     [string]$Exchange = "bybit",
     [string]$ProductId = "SOL-USD",
     [ValidateSet("simulator", "live")]
     [string]$ExecutionMode = "simulator",
-    [ValidateSet("synthetic", "bybit_rest")]
+    [ValidateSet("synthetic", "bybit_rest", "postgres_tail")]
     [string]$MarketDataProvider = "synthetic",
     [int]$DurationSeconds = 45,
     [int]$TickIntervalMs = 800,
@@ -154,6 +155,9 @@ Write-Info "Phase4 canary smoke iniciado (solo V4)."
 Write-Info "RepoRoot=$RepoRoot"
 Write-Info "WorkerRustDir=$WorkerRustDir"
 Write-Info "DB/Redis V4: $DbDsn | $RedisUrl"
+if ($MarketDataProvider -eq "postgres_tail") {
+    Write-Info "Market data source (read-only): $MarketDataDbDsn"
+}
 
 if ($MarketDataProvider -eq "bybit_rest" -and -not $SkipBybitPreflight) {
     $bybitUrl = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=SOLUSDT"
@@ -183,6 +187,10 @@ $envVars = @{
     TB_CHAOS_BYBIT_MARKET_FAIL_EVERY_N = 0
     TB_CHAOS_BYBIT_EXEC_FAIL_EVERY_N = 0
 }
+if ($MarketDataProvider -eq "postgres_tail") {
+    $envVars["TB_MARKET_DATA_DB_DSN"] = $MarketDataDbDsn
+    $envVars["TB_MARKET_DATA_DB_START_MODE"] = "latest"
+}
 
 $run = Run-WorkerWindow -EnvVars $envVars -Seconds $DurationSeconds
 $events = $run.Events
@@ -192,6 +200,10 @@ $requiredMinCycles = $MinCycles
 if ($requiredMinCycles -lt 0) {
     if ($MarketDataProvider -eq "bybit_rest") {
         # Bybit can have low event density in stable windows.
+        $requiredMinCycles = 1
+    }
+    elseif ($MarketDataProvider -eq "postgres_tail") {
+        # Tailing DB ticks can also have sparse event density in short windows.
         $requiredMinCycles = 1
     }
     else {

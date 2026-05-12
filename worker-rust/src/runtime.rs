@@ -17,7 +17,8 @@ use crate::{
     },
     providers::{
         BybitLiveExecutionProvider, BybitRestMarketDataProvider, BybitSimulatorExecutionProvider,
-        ExecutionProvider, MarketDataProvider, ReplayMarketDataProvider,
+        ExecutionProvider, MarketDataProvider, PostgresTailMarketDataProvider,
+        ReplayMarketDataProvider,
         SyntheticMarketDataProvider,
     },
     publisher::{StatePublisher, StdoutStatePublisher},
@@ -28,6 +29,7 @@ const EXEC_MODE_SIMULATOR: &str = "simulator";
 const MARKET_DATA_SYNTHETIC: &str = "synthetic";
 const MARKET_DATA_REPLAY: &str = "replay";
 const MARKET_DATA_BYBIT_REST: &str = "bybit_rest";
+const MARKET_DATA_POSTGRES_TAIL: &str = "postgres_tail";
 const SCHEDULE_MODE_IMMEDIATE: &str = "immediate";
 const SCHEDULE_MODE_NEXT_CYCLE: &str = "next_cycle";
 const ENV_ALLOW_RESET_COMMAND: &str = "TB_ALLOW_RESET_COMMAND";
@@ -837,8 +839,15 @@ fn build_market_data_provider(
                 tick_interval_ms,
             )),
         )),
+        MARKET_DATA_POSTGRES_TAIL | "postgres_ticks" | "v3_ticks" => Ok((
+            selected,
+            Box::new(PostgresTailMarketDataProvider::from_strategy(
+                config,
+                tick_interval_ms,
+            )?),
+        )),
         other => Err(anyhow!(
-            "unsupported TB_MARKET_DATA_PROVIDER='{other}'. expected one of: {MARKET_DATA_BYBIT_REST}, {MARKET_DATA_REPLAY}, {MARKET_DATA_SYNTHETIC}"
+            "unsupported TB_MARKET_DATA_PROVIDER='{other}'. expected one of: {MARKET_DATA_BYBIT_REST}, {MARKET_DATA_REPLAY}, {MARKET_DATA_SYNTHETIC}, {MARKET_DATA_POSTGRES_TAIL}"
         )),
     }
 }

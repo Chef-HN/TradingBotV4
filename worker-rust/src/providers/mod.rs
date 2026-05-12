@@ -2,6 +2,7 @@ mod bybit_live;
 mod bybit_market_data;
 mod bybit_simulator;
 mod market_data;
+mod postgres_tail_market_data;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -12,6 +13,7 @@ pub use bybit_live::BybitLiveExecutionProvider;
 pub use bybit_market_data::BybitRestMarketDataProvider;
 pub use bybit_simulator::BybitSimulatorExecutionProvider;
 pub use market_data::{ReplayMarketDataProvider, SyntheticMarketDataProvider};
+pub use postgres_tail_market_data::PostgresTailMarketDataProvider;
 
 #[derive(Debug, Clone)]
 pub struct ExecutionReconciliationSnapshot {

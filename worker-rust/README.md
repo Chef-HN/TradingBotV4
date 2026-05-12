@@ -9,6 +9,8 @@ Este worker implementa el esqueleto de V4 con:
 - `MarketDataProvider` desacoplado:
   - `SyntheticMarketDataProvider`
   - `ReplayMarketDataProvider`
+  - `BybitRestMarketDataProvider`
+  - `PostgresTailMarketDataProvider` (tail read-only de tabla `ticks`)
 - Scheduler de cierre diario en zona local (`session_timezone_iana`) con cambios:
   - `next_cycle`: aplica al siguiente ciclo.
   - `immediate`: recalcula inmediatamente el siguiente cierre.
@@ -38,6 +40,10 @@ Este worker implementa el esqueleto de V4 con:
 - `TB_CHAOS_REDIS_FAIL_EVERY_N` (simula fallo de Redis cada N operaciones)
 - `TB_CHAOS_BYBIT_MARKET_FAIL_EVERY_N` (simula fallo de market data Bybit cada N requests)
 - `TB_CHAOS_BYBIT_EXEC_FAIL_EVERY_N` (simula fallo de ejecucion Bybit cada N llamadas API)
+- `TB_MARKET_DATA_PROVIDER` (`synthetic` | `replay` | `bybit_rest` | `postgres_tail`)
+- `TB_MARKET_DATA_DB_DSN` (solo `postgres_tail`; DSN de lectura para ticks, default V3 local)
+- `TB_MARKET_DATA_DB_TABLE` (solo `postgres_tail`, default `ticks`)
+- `TB_MARKET_DATA_DB_START_MODE` (`latest` | `oldest`, default `latest`)
 
 ## Smoke test de Chaos (staging V4 aislado)
 
@@ -125,6 +131,7 @@ Defaults del script (solo V4):
 - `MinCycles` dinamico:
   - `synthetic`: `5`
   - `bybit_rest`: `1` (ventanas estables pueden no generar muchos eventos)
+  - `postgres_tail`: `1` (depende del ritmo de ticks en BD fuente)
 
 Opcional (si quieres fallback automatico documentado al fallar):
 ```powershell
@@ -138,6 +145,11 @@ Nota para `bybit_rest`:
 - Diagnostico extendido de egress:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\phase4_bybit_egress_diagnostic.ps1
+```
+
+Paralelo V3 (read-only) con `postgres_tail`:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\phase4_canary_smoke.ps1 -MarketDataProvider postgres_tail -MarketDataDbDsn postgresql://tradingbot:tradingbot@localhost:5433/tradingbotv3 -DurationSeconds 60
 ```
 
 Notas:
