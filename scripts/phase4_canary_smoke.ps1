@@ -157,6 +157,18 @@ Write-Info "WorkerRustDir=$WorkerRustDir"
 Write-Info "DB/Redis V4: $DbDsn | $RedisUrl"
 if ($MarketDataProvider -eq "postgres_tail") {
     Write-Info "Market data source (read-only): $MarketDataDbDsn"
+
+    # postgres_tail inherits cadence from external writer (V3).
+    # Keep strict defaults for other providers, but avoid false negatives here
+    # unless caller explicitly requested tighter thresholds.
+    if (-not $PSBoundParameters.ContainsKey("MarketDataGapWarnMs") -and $MarketDataGapWarnMs -lt 7000) {
+        $MarketDataGapWarnMs = 7000
+        Write-Info "Ajuste automatico: MarketDataGapWarnMs=7000 para provider postgres_tail."
+    }
+    if (-not $PSBoundParameters.ContainsKey("HeartbeatLagWarnMs") -and $HeartbeatLagWarnMs -lt 7000) {
+        $HeartbeatLagWarnMs = 7000
+        Write-Info "Ajuste automatico: HeartbeatLagWarnMs=7000 para provider postgres_tail."
+    }
 }
 
 if ($MarketDataProvider -eq "bybit_rest" -and -not $SkipBybitPreflight) {

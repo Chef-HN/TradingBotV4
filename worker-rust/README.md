@@ -132,6 +132,9 @@ Defaults del script (solo V4):
   - `synthetic`: `5`
   - `bybit_rest`: `1` (ventanas estables pueden no generar muchos eventos)
   - `postgres_tail`: `1` (depende del ritmo de ticks en BD fuente)
+- Ajuste automatico de umbrales en `postgres_tail`:
+  - si no pasas `-MarketDataGapWarnMs` / `-HeartbeatLagWarnMs`, el script usa `7000ms`
+  - evita falsos negativos cuando el ritmo de ticks en la BD fuente supera `5s`
 
 Opcional (si quieres fallback automatico documentado al fallar):
 ```powershell
